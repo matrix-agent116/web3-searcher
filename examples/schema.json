@@ -1,0 +1,28 @@
+{
+  "tables": [
+    {
+      "name": "transactions",
+      "primary_key": "hash",
+      "flush_docs": 4096,
+      "documents": "transactions.json",
+      "fields": [
+        {"name": "hash", "type": "VARCHAR", "stored": true, "indexed": true},
+        {"name": "from", "type": "VARCHAR", "stored": true, "indexed": true},
+        {"name": "to", "type": "VARCHAR", "stored": true, "indexed": true},
+        {"name": "blockNumber", "type": "VARCHAR", "stored": true, "indexed": true},
+        {"name": "value", "type": "VARCHAR", "stored": true, "indexed": false}
+      ]
+    },
+    {
+      "name": "blocks",
+      "primary_key": "height",
+      "documents": "blocks.json",
+      "fields": [
+        {"name": "height", "type": "BIGINT", "stored": true, "indexed": true},
+        {"name": "description", "type": "VARCHAR", "stored": true, "indexed": true, "analyzer": "text"},
+        {"name": "metadata", "type": "STRUCT(network VARCHAR, tags VARCHAR[])", "stored": true, "indexed": true},
+        {"name": "batch", "type": "BIGINT", "stored": false, "indexed": true}
+      ]
+    }
+  ]
+}
