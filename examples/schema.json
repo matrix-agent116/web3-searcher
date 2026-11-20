@@ -2,7 +2,6 @@
   "tables": [
     {
       "name": "transactions",
-      "flush_docs": 4096,
       "merge_segments": 16,
       "documents": "transactions.json",
       "fields": [

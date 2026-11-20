@@ -153,7 +153,9 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     schema_path = index / "schema.json"
     catalog = json.loads(schema_path.read_text())
     transactions = catalog["tables"][0]
-    transactions.pop("flush_docs")  # Exercise the default document threshold.
+    # Keep the rollback and recovery checkpoints in this scenario small.
+    for table in catalog["tables"]:
+        table["flush_docs"] = 256
     schema_path.write_text(json.dumps(catalog))
     indexer = start(stack, "indexer", i, index, i)
     start(stack, "updater", b, b, i)
@@ -641,13 +643,14 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     for n in range(24):
         assert query("hash", f"concurrent-{n}") == [dict(added, hash=f"concurrent-{n}")]
 
-# Two tables own separate memory segments, counters, workers and WALs.
+# Tables use independent default or explicitly configured flush thresholds.
 with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     index = Path(work)
     schema = json.loads(SAMPLE.with_name("schema.json").read_text())["tables"][0]
     schema.pop("documents")
     tables = [dict(schema, name=name, flush_docs=limit, merge_segments=2)
               for name, limit in (("fast", 3), ("slow", 17))]
+    tables.append({"name": "default_limit", "fields": schema["fields"]})
     (index / "schema.json").write_text(json.dumps({"tables": tables}))
     origin = endpoints()[0]
     server = start(stack, "indexer", origin, index, origin)
@@ -678,6 +681,14 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     batch("slow", ["shared", "last"])
     assert len(segment_entries(index / "slow" / "segments")) == 1
     assert not list((index / "slow").glob("updates.*.wal"))
+
+    default_dir = index / "default_limit"
+    batch("default_limit", (str(n) for n in range(14_399)))
+    assert segment_entries(default_dir / "segments") == []
+    assert list(default_dir.glob("updates.*.wal"))
+    batch("default_limit", ["last"])
+    assert len(segment_entries(default_dir / "segments")) == 1
+    assert not list(default_dir.glob("updates.*.wal"))
 
 # Match all components on the same live row, including an indexed-only field.
 with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:

@@ -32,7 +32,7 @@ struct TableSchema {
   std::optional<std::filesystem::path> documents;
   std::vector<Field> fields;
   // Count every input document, including repeated updates to the same key.
-  std::uint64_t flush_docs = 256;
+  std::uint64_t flush_docs = 14'400;
   std::uint64_t merge_segments = 16;
   std::map<std::string, irs::field_id, std::less<>> leaves;
   std::vector<irs::field_id> MatchFields(simdjson::dom::array names) const;
