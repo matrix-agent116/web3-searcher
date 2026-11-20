@@ -36,7 +36,7 @@ ExternalProject_Add(libhv_source
 include(CTest)
 set(web3_targets indexer searcher updater)
 if(BUILD_TESTING)
-  list(APPEND web3_targets http_test)
+  list(APPEND web3_targets http_test storage_test)
 endif()
 
 ExternalProject_Add(serenedb
@@ -65,6 +65,19 @@ ExternalProject_Add(serenedb
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_test(NAME http_test COMMAND "${CMAKE_BINARY_DIR}/bin/http_test")
+  function(add_storage_test component filter)
+    add_test(NAME ${component}_test COMMAND "${CMAKE_BINARY_DIR}/bin/storage_test"
+             "--gtest_filter=${filter}" --gtest_fail_if_no_test_selected)
+    set_tests_properties(${component}_test PROPERTIES LABELS storage TIMEOUT 30)
+  endfunction()
+  add_storage_test(memory_segment "MemorySegmentTest.*")
+  add_storage_test(memory_segment_manager "MemorySegmentManagerTest.*")
+  add_storage_test(row_codec "RowCodecTest.*")
+  add_storage_test(segment_merger "SegmentMergerTest.*:SegmentCleanupTest.*")
+  add_storage_test(snapshot "SnapshotTest.*")
+  add_storage_test(storage "StorageTest.*")
+  add_storage_test(update_log "UpdateLogTest.*")
+  add_storage_test(utils "StorageUtilsTest.*")
   set_tests_properties(http_test PROPERTIES TIMEOUT 30)
   add_test(NAME services_smoke COMMAND "${Python3_EXECUTABLE}"
            "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.py" "${CMAKE_BINARY_DIR}/bin")

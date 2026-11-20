@@ -23,7 +23,13 @@ int main(int argc, char** argv) {
     if (argc == 4 && std::string_view(argv[1]) == "serve") {
       web3::ThreadPool pool(web3::CpuCoreCount());
       web3::Serve(argv[2],
-                  {{"/search",
+                  {{"/block_number",
+                    [&](web3::Json request, web3::Completion done) {
+                      web3::PostAsync(argv[3], "/block_number",
+                                      simdjson::minify(request),
+                                      std::move(done));
+                    }},
+                   {"/search",
                     [&](web3::Json request, web3::Completion done) {
                       auto table = request["table"];
                       return web3::PostAsync(

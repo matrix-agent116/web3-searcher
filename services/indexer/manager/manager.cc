@@ -1,4 +1,4 @@
-#include "indexer/table_manager.h"
+#include "indexer/manager/manager.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -7,9 +7,9 @@
 #include <system_error>
 #include <utility>
 
-#include "indexer/directory_lock.h"
+#include "indexer/storage/utils.h"
 
-namespace web3 {
+namespace web3::indexer {
 namespace fs = std::filesystem;
 namespace {
 
@@ -28,7 +28,7 @@ std::size_t CreateTable(const fs::path& directory,
                             "create staging directory");
   }
   try {
-    Table::Write(temp, database, schema, documents);
+    Storage::Write(temp, database, schema, documents);
     fs::rename(temp, directory / schema.name);
   } catch (...) {
     fs::remove_all(temp);
@@ -39,10 +39,9 @@ std::size_t CreateTable(const fs::path& directory,
 
 }  // namespace
 
-TableManager::TableManager(fs::path directory)
-    : directory_(std::move(directory)) {}
+Manager::Manager(fs::path directory) : directory_(std::move(directory)) {}
 
-std::string TableManager::EnsureTables() {
+std::string Manager::EnsureTables() {
   std::size_t indexed = 0;
   std::call_once(initialized_, [&] {
     auto lock = LockDirectory(directory_);
@@ -55,7 +54,8 @@ std::string TableManager::EnsureTables() {
       if (!fs::exists(path) || (fs::is_directory(path) && fs::is_empty(path))) {
         indexed += CreateTable(directory_, *database_.instance, schema);
       }
-      opened.try_emplace(name, path, *database_.instance, std::move(schema));
+      opened.emplace(name, std::make_shared<Storage>(path, database_.instance,
+                                                     std::move(schema)));
     }
     tables_.swap(opened);
   });
@@ -63,22 +63,36 @@ std::string TableManager::EnsureTables() {
          R"(,"indexed":)" + std::to_string(indexed) + "}";
 }
 
-std::string TableManager::Upsert(std::string_view name,
-                                 simdjson::dom::array documents) {
+std::vector<std::shared_ptr<Storage>> Manager::GetStorages() const {
+  std::vector<std::shared_ptr<Storage>> storages;
+  storages.reserve(tables_.size());
+  for (const auto& [name, storage] : tables_) storages.push_back(storage);
+  return storages;
+}
+
+Storage& Manager::GetStorage(std::string_view name) const {
   auto table = tables_.find(name);
   if (table == tables_.end())
     throw std::invalid_argument("unknown table: " + std::string(name));
-  table->second.Upsert(documents);
-  return R"({"ok":true,"upserted":)" + std::to_string(documents.size()) + "}";
+  return *table->second;
 }
 
-std::string TableManager::Search(std::string_view name, std::string_view field,
-                                 std::string_view value) const {
-  auto table = tables_.find(name);
-  if (table == tables_.end()) {
-    throw std::invalid_argument("unknown table: " + std::string(name));
-  }
-  return table->second.Search(field, value);
+absl::int128 Manager::GetBlockNumber(std::string_view name) const {
+  return GetStorage(name).GetBlockNumber();
 }
 
-}  // namespace web3
+std::string Manager::Upsert(std::string_view name, uint64_t block_number,
+                            simdjson::dom::array match_fields,
+                            simdjson::dom::array documents) {
+  const auto committed =
+      GetStorage(name).Upsert(block_number, match_fields, documents);
+  return R"({"ok":true,"upserted":)" + std::to_string(documents.size()) +
+         R"(,"block_number":)" + std::to_string(committed) + "}";
+}
+
+std::string Manager::Search(std::string_view name, std::string_view field,
+                            std::string_view value) const {
+  return GetStorage(name).Search(field, value);
+}
+
+}  // namespace web3::indexer

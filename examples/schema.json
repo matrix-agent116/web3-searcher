@@ -2,8 +2,8 @@
   "tables": [
     {
       "name": "transactions",
-      "primary_key": "hash",
       "flush_docs": 4096,
+      "merge_segments": 16,
       "documents": "transactions.json",
       "fields": [
         {"name": "hash", "type": "VARCHAR", "stored": true, "indexed": true},
@@ -15,7 +15,6 @@
     },
     {
       "name": "blocks",
-      "primary_key": "height",
       "documents": "blocks.json",
       "fields": [
         {"name": "height", "type": "BIGINT", "stored": true, "indexed": true},
