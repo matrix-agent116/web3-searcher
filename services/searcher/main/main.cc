@@ -7,7 +7,7 @@
 #include "common/thread_pool.h"
 #include "searcher/manager/manager.h"
 #include "searcher/router/internal_routes.h"
-#include "searcher/router/router.h"
+#include "searcher/router/routes.h"
 
 int main(int argc, char** argv) {
   try {

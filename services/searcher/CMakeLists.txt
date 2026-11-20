@@ -38,7 +38,7 @@ if(WEB3_BUILD_TESTING)
   target_link_libraries(table_tests PRIVATE web3_searcher_table GTest::gtest_main)
 endif()
 
-add_library(web3_searcher_router STATIC router/internal_routes.cc router/router.cc query/query_template.cc)
+add_library(web3_searcher_router STATIC router/internal_routes.cc router/routes.cc query/query_template.cc)
 target_link_libraries(web3_searcher_router PUBLIC web3_searcher_table)
 add_executable(searcher main/main.cc)
 target_link_libraries(searcher PRIVATE web3_searcher_router)
@@ -46,7 +46,8 @@ if(WEB3_BUILD_TESTING)
   add_executable(searcher_test
     manager/manager_test.cc
     query/query_template_test.cc
-    router/router_test.cc
+    router/internal_routes_test.cc
+    router/routes_test.cc
   )
   target_link_libraries(searcher_test PRIVATE web3_searcher_router GTest::gtest_main)
 endif()

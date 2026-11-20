@@ -1,34 +1,24 @@
-#include "searcher/router/router.h"
+#include "searcher/router/routes.h"
 
 #include <gtest/gtest.h>
 
 #include <filesystem>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <utility>
 
 #include "searcher/manager/manager.h"
 #include "searcher/manager/test_utils.h"
 #include "searcher/router/internal_routes.h"
+#include "searcher/router/test_utils.h"
 
 namespace web3::searcher {
 namespace {
 
-using RouterTest = test::CatalogFixture;
+using RoutesTest = test::CatalogFixture;
+using test::Invoke;
 
-Reply Invoke(const Handler& handler, std::string_view body = "{}") {
-  simdjson::dom::parser parser;
-  std::optional<Reply> result;
-  handler(parser.parse(body.data(), body.size()).value(), [&](Reply reply) {
-    EXPECT_FALSE(result.has_value());
-    result = std::move(reply);
-  });
-  return std::move(result).value();
-}
-
-TEST_F(RouterTest, LoadsRelativeRoutesAndExecutesGetAndPostAgainstTheCatalog) {
+TEST_F(RoutesTest, LoadsRelativeRoutesAndExecutesGetAndPostAgainstTheCatalog) {
   Manager manager(path_);
   manager.EnsureTables();
   auto routes = InternalRoutes(manager);
@@ -55,49 +45,7 @@ TEST_F(RouterTest, LoadsRelativeRoutesAndExecutesGetAndPostAgainstTheCatalog) {
   EXPECT_TRUE(routes.post.contains("/solidity"));
 }
 
-TEST_F(RouterTest, BuiltInUpdatesQueriesAndHeightShareOneView) {
-  Manager manager(path_);
-  manager.EnsureTables();
-  const auto routes = InternalRoutes(manager);
-  EXPECT_TRUE(routes.get.empty());
-  ASSERT_EQ(routes.post.size(), 4);
-  const auto& submit = routes.post.at("/candidate");
-  const auto& confirm = routes.post.at("/solidity");
-  const auto& search = routes.post.at("/search");
-  const auto& height = routes.post.at("/block_number");
-  const auto pending =
-      Invoke(submit, R"({"table":"transactions","block_number":4,
-      "match_field":["hash"],"documents":[{"hash":"a","value":"pending"}]})");
-  EXPECT_EQ(pending.status, 200);
-  EXPECT_EQ(pending.body, R"({"ok":true,"upserted":1,"block_number":4})");
-  EXPECT_EQ(Invoke(height, R"({"table":"transactions"})").body,
-            R"({"ok":true,"block_number":-1})");
-  EXPECT_EQ(Invoke(search, R"({"query":"hash:a"})").body,
-            R"({"ok":true,"hits":[{"hash":"a","value":"pending"}]})");
-
-  const auto confirmed =
-      Invoke(confirm, R"({"table":"transactions","block_number":4,
-      "match_field":["hash"],"documents":[{"hash":"a","value":"final"},
-                                          {"hash":"b","value":"final"}]})");
-  EXPECT_EQ(confirmed.status, 200);
-  EXPECT_EQ(confirmed.body, R"({"ok":true,"upserted":2,"block_number":4})");
-  EXPECT_EQ(Invoke(height, R"({"table":"transactions"})").body,
-            R"({"ok":true,"block_number":4})");
-  EXPECT_EQ(
-      Invoke(
-          search,
-          R"({"table":"transactions","query":"*:*","fields":["value"],"limit":1})")
-          .body,
-      R"({"ok":true,"hits":[{"value":"final"}]})");
-  EXPECT_EQ(Invoke(search, R"({"table":"blocks","query":"*:*"})").body,
-            R"({"ok":true,"hits":[]})");
-  EXPECT_THROW(Invoke(search, R"({"query":"*:*","fields":[]})"),
-               std::invalid_argument);
-  EXPECT_THROW(Invoke(search, R"({"query":"*:*","limit":0})"),
-               std::invalid_argument);
-}
-
-TEST_F(RouterTest, InvalidManifestsReportTheFailingEntry) {
+TEST_F(RoutesTest, InvalidManifestsReportTheFailingEntry) {
   Manager manager(path_);
   auto routes = InternalRoutes(manager);
   const auto config = path_ / "router.conf";
@@ -134,7 +82,7 @@ TEST_F(RouterTest, InvalidManifestsReportTheFailingEntry) {
   }
 }
 
-TEST_F(RouterTest, ConfiguredRouteHidesStorageErrorDetails) {
+TEST_F(RoutesTest, ConfiguredRouteHidesStorageErrorDetails) {
   Manager manager(path_);
   manager.EnsureTables();
   HttpRoutes routes;
@@ -147,7 +95,7 @@ TEST_F(RouterTest, ConfiguredRouteHidesStorageErrorDetails) {
   EXPECT_EQ(reply.body, R"({"ok":false,"error":"query execution failed"})");
 }
 
-TEST_F(RouterTest, RepeatedProjectionOfAWideColumnReturnsPayloadTooLarge) {
+TEST_F(RoutesTest, RepeatedProjectionOfAWideColumnReturnsPayloadTooLarge) {
   const std::string value(kMaxHttpBodyBytes / 2, 'x');
   WriteFile("transactions.json",
             R"([{"hash":"a","value":")" + value + R"("}])");

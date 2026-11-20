@@ -1,5 +1,5 @@
-#ifndef WEB3_SEARCHER_SERVICES_SEARCHER_ROUTER_ROUTER_H_
-#define WEB3_SEARCHER_SERVICES_SEARCHER_ROUTER_ROUTER_H_
+#ifndef WEB3_SEARCHER_SERVICES_SEARCHER_ROUTER_ROUTES_H_
+#define WEB3_SEARCHER_SERVICES_SEARCHER_ROUTER_ROUTES_H_
 
 #include <filesystem>
 
@@ -14,4 +14,4 @@ void LoadRoutes(const std::filesystem::path& config, const Manager& manager,
 
 }  // namespace web3::searcher
 
-#endif  // WEB3_SEARCHER_SERVICES_SEARCHER_ROUTER_ROUTER_H_
+#endif  // WEB3_SEARCHER_SERVICES_SEARCHER_ROUTER_ROUTES_H_
