@@ -71,20 +71,31 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     index = Path(work) / "index"
     prepare_catalog(index)
     origin = endpoints()[0]
-    start(stack, "searcher", origin, index, origin)
+    start(stack, "searcher", origin, index, origin, ROUTER_CONFIG)
+    # The only generated row has a null recipient. Both aggregate routes must
+    # accept an empty match, even when more readers than aggregate slots run.
+    for mode in ("hash", "received_stats", "top_senders"):
+        single_kind = cli("indexer_benchmark", origin, "--blocks", "1", "--tx-per-block", "1",
+                          "--query-mode", mode, "--queries", "9", "--query-threads", "6")
+        assert single_kind["search"]["requests"] == single_kind["query_types"][mode]["requests"] == 9
+        assert all(value is None for name, value in single_kind["query_types"].items() if name != mode)
     hashes = set()
     warmup = cli("indexer_benchmark", origin, "--blocks", "16", "--tx-per-block", "3", "--queries", "5")
     assert warmup["candidate"]["requests"] == 16 and warmup["solidity"] is None
     assert warmup["transactions"] == 0 and warmup["search"]["requests"] == 5
+    assert {name: result["requests"] for name, result in warmup["query_types"].items()} == {
+        "hash": 2, "received_stats": 2, "top_senders": 1}
     assert warmup["last_solidity_block"] == block_number(origin, "transactions") == -1
     for first, block_count, finalized in ((0, 18, 1), (18, 2, 3)):
         stats = cli("indexer_benchmark", origin, "--blocks", str(block_count), "--tx-per-block",
-                    "3", "--queries", "7", "--query-threads", "2")
+                    "3", "--queries", "7", "--query-threads", "4")
         assert (stats["first_block"], stats["last_block"]) == (first, first + block_count - 1)
         assert stats["transactions"] == 6 and stats["solidity"]["requests"] == 2
         assert stats["candidate"]["requests"] == block_count
         assert stats["transactions_per_second"] > 0 and stats["search"]["requests"] == 7
-        for phase in (stats["candidate"], stats["solidity"], stats["search"]):
+        assert [stats["query_types"][name]["requests"] for name in
+                ("hash", "received_stats", "top_senders")] == [3, 2, 2]
+        for phase in (stats["candidate"], stats["solidity"], stats["search"], *stats["query_types"].values()):
             assert phase["requests_per_second"] > 0
             assert 0 < phase["p50_ms"] <= phase["p95_ms"] <= phase["p99_ms"]
             assert phase["max_ms"] > 0 and 0 <= phase["over_1s"] <= phase["requests"]
@@ -99,12 +110,13 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
                         continue
                     assert row[field].startswith("0x") and len(row[field]) == digits + 2
                     int(row[field][2:], 16)
-                assert row["blockNumber"] == hex(height) and int(row["value"], 16) >= 0
+                assert row["blockNumber"] == hex(height) and row["value"].isascii() and row["value"].isdecimal()
                 hashes.add(row["hash"])
     assert len(hashes) == 12
     writes_only = cli("indexer_benchmark", origin, "--blocks", "1", "--tx-per-block",
                       "1", "--queries", "0")
     assert writes_only["last_block"] == 20 and writes_only["search"] is None
+    assert all(phase is None for phase in writes_only["query_types"].values())
     # A single completed write step ends continuous mode immediately.
     # An explicit query budget still runs in full.
     single = cli("indexer_benchmark", origin, "--blocks", "1", "--tx-per-block", "1")
@@ -137,6 +149,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     schema_path = index / "schema.json"
     catalog = json.loads(schema_path.read_text())
     transactions = catalog["tables"][0]
+    transactions["fields"].append({"name": "payload", "type": "VARCHAR", "stored": True, "indexed": False})
     # Keep the rollback and recovery checkpoints in this scenario small.
     for table in catalog["tables"]:
         table["flush_docs"] = 256
@@ -151,7 +164,16 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     for endpoint in (i, b):
         for removed in ("/update", "/upsert"):
             assert http_request(endpoint, "POST", removed, "{}", {"Content-Type": "application/json"})[0] == 404
-    rows = json.loads(SAMPLE.read_text())
+    rows = [dict(row, payload=None) for row in json.loads(SAMPLE.read_text())]
+    address = rows[0]["to"]
+    wei = rows[0]["value"]
+    received = {"transfer_count": 1, "value_count": 1, "total_wei": wei,
+                "average_wei": wei, "min_wei": wei, "max_wei": wei}
+    stats_path = "/v1/account/received-stats"
+    expected = (200, {"ok": True, "hits": [received]})
+    assert http_request(i, "GET", f"{stats_path}?address={address}") == expected
+    assert http_request(i, "POST", stats_path, json.dumps({"address": address}),
+                        {"Content-Type": "application/json"}) == expected
     # The catalog is published before /health succeeds, without an update request.
     assert (index / "transactions" / "segments").is_file()
     assert http_request(b, "POST", "/build", "{}", {"Content-Type": "application/json"})[0] == 404
@@ -185,7 +207,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
             assert reply[1] == {"ok": True, "block_number": height, "upserted": len(docs)}
         return reply
 
-    changed = dict(rows[0], blockNumber="0x20", value="last")
+    changed = dict(rows[0], blockNumber="0x20", value="123")
     new = dict(rows[1], hash="new-transaction", blockNumber="0x30")
     batch = [dict(changed, blockNumber="0x19"), new, changed]
     source = root / "updates.json"
@@ -200,7 +222,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     # writer is waiting, another worker must still serve the committed row.
     workers = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
     if workers and workers > 1:
-        replacement = dict(changed, value="after lock release")
+        replacement = dict(changed, value="124")
         query = json.dumps({"query": f"hash:{changed['hash']}"})
         with ThreadPoolExecutor(max_workers=2) as clients:
             fd = os.open(index / "transactions", os.O_RDONLY)
@@ -250,14 +272,14 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     pending = table_path / "segments.pending"
     pending.mkdir()
     try:
-        assert upsert([dict(changed, value="discard")] * 256)[0] >= 400
+        assert upsert([dict(changed, value="999")] * 256)[0] >= 400
         assert (table_path / "segments").read_bytes() == published
         assert set(table_path.iterdir()) == files_before | {pending}
         assert index_query(i, f"hash:{rows[0]['hash']}")["hits"] == [changed]
     finally:
         pending.rmdir()
     assert upsert([changed])[0] == 200
-    assert upsert([dict(changed, value="discard"), {"hash": None}])[0] == 400
+    assert upsert([dict(changed, value="999"), {"hash": None}])[0] == 400
     assert upsert([{}])[0] == 400
     assert upsert([changed], "missing")[0] == 400
     assert index_query(i, f"hash:{rows[0]['hash']}")["hits"] == [changed]
@@ -314,7 +336,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     # A large row remains buffered. The next row reaches the configured count.
     manifest = index / "transactions" / "segments"
     previous_count = len(segment_entries(manifest))
-    large = dict(changed, hash="large", value="x" * (2 * 1024 * 1024))
+    large = dict(changed, hash="large", payload="x" * (2 * 1024 * 1024))
     assert upsert([large])[0] == 200
     assert len(segment_entries(manifest)) == previous_count
     assert index_query(i, "hash:large")["hits"] == [large]
@@ -419,8 +441,8 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
                         ("description", "ethereum"), ("height", "16"), ("batch", "1")):
         assert index_query(i, f"{field}:{term}", table="blocks")["hits"] == [expected]
     assert index_query(i, "hash:xyz", table="events")["hits"] == []
-    assert index_query(i, "blockNumber:0x10")["hits"] == rows
-    index_query(i, "value:0x0", ok=False)
+    assert index_query(i, "blockNumber:0x10")["hits"] == json.loads(SAMPLE.read_text())
+    index_query(i, "value:0", ok=False)
     index_query(i, "height:16", table="missing_table", ok=False)
 
     invalid_key = dict(block, height="not-an-integer")
@@ -496,12 +518,12 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
         assert reply[0] == 400, reply
         assert hits("hash", "uncommitted") == []
 
-    write([dict(second, value="patched")])
-    assert hits("hash", second["hash"]) == [dict(second, value="patched")]
+    write([dict(second, value="2")])
+    assert hits("hash", second["hash"]) == [dict(second, value="2")]
     server.kill()
     server.wait(timeout=10)
     server = start(stack, "searcher", origin, index, origin)
-    assert hits("from", second["from"]) == [first, dict(second, value="patched")]
+    assert hits("from", second["from"]) == [first, dict(second, value="2")]
     write([dict(first, value=None)])
 
     def latest_dictionary(table):
@@ -514,10 +536,10 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     server.kill()
     server.wait(timeout=10)
     server = start(stack, "searcher", origin, index, origin)
-    assert hits("from", first["from"]) == [dict(first, value=None), dict(second, value="patched")]
+    assert hits("from", first["from"]) == [dict(first, value=None), dict(second, value="2")]
 
-    moved = dict(second, **{"from": "new-address", "value": "moved"})
-    latest = dict(moved, value="latest")
+    moved = dict(second, **{"from": "new-address", "value": "3"})
+    latest = dict(moved, value="4")
     write([moved, latest])
     assert latest_dictionary("transactions") != empty_dictionary
     assert hits("from", first["from"]) == [dict(first, value=None)]
@@ -527,15 +549,15 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     server = start(stack, "searcher", origin, index, origin)
     assert hits("from", "new-address") == [latest]
     # Whole-row replacement clears omitted indexed fields.
-    write([{"hash": second["hash"], "value": "cleared"}])
+    write([{"hash": second["hash"], "value": "5"}])
     assert hits("from", "new-address") == []
     # A patch followed by a full row in a mixed segment also survives replay.
     inserted = dict(first, hash="next-key")
-    write([dict(first, value="after-restart"), inserted])
+    write([dict(first, value="6"), inserted])
     server.kill()
     server.wait(timeout=10)
     server = start(stack, "searcher", origin, index, origin)
-    assert hits("from", first["from"]) == [dict(first, value="after-restart"), inserted]
+    assert hits("from", first["from"]) == [dict(first, value="6"), inserted]
 
     # Change the match field across requests in one checkpoint. The old hash
     # must stay absent on replay even when a later request reuses that hash.
@@ -548,7 +570,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     server = start(stack, "searcher", origin, index, origin)
     assert hits("hash", "renamed") == []
     assert hits("hash", "renamed-again") == [renamed]
-    patched = dict(renamed, value="updated-via-address")
+    patched = dict(renamed, value="7")
     write([patched], "from")
     server.kill()
     server.wait(timeout=10)
@@ -614,7 +636,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
         raise AssertionError(f"merge did not reclaim {old_file}: {manifest.read_text()}")
 
     seed_file, = directory.glob("*.idx")
-    patched = dict(first, value="stored-column-patch")
+    patched = dict(first, value="8")
     changed = dict(second, to="new-destination")
     update([patched, changed], height=100)
     assert len(segment_entries(manifest)) == 2
@@ -672,9 +694,10 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     server = start(stack, "searcher", origin, index, origin)
 
     next_height = count(1)
+    amounts = {"fast": "1", "slow": "2", "default_limit": "3"}
     def batch(table, hashes):
         height = next(next_height)
-        rows = [{"hash": key, "value": table} for key in hashes]
+        rows = [{"hash": key, "value": amounts[table]} for key in hashes]
         status, result = http_request(origin, "POST", "/solidity", json.dumps({
             "table": table, "block_number": height, "match_field": ["hash"], "documents": rows}), headers)
         assert (status, result) == (200, {"ok": True, "block_number": height, "upserted": len(rows)})
@@ -693,7 +716,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     for table in ("fast", "slow"):
         status, result = http_request(origin, "POST", "/search", json.dumps({
             "table": table, "query": "hash:shared"}), headers)
-        assert status == 200 and [row["value"] for row in result["hits"]] == [table]
+        assert status == 200 and [row["value"] for row in result["hits"]] == [amounts[table]]
     batch("slow", ["shared", "last"])
     assert len(segment_entries(index / "slow" / "segments")) == 1
     assert not list((index / "slow").glob("updates.*.wal"))
@@ -811,7 +834,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     assert public_height(origin) == 1
     write(100, [{"hash": "a"}, {"hash": "b"}])
     assert not list(directory.glob("updates.*.wal"))
-    write(101, [{"hash": "c", "value": "in memory"}])
+    write(101, [{"hash": "c", "value": "101"}])
     assert public_height(origin) == 101
     assert block_number(origin, "blocks") == -1
     wal, = directory.glob("updates.*.wal")
@@ -824,7 +847,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
         assert (directory / "segments").read_text().splitlines()[0] == "block_number 100"
     finally:
         pending_manifest.rmdir()
-    write(102, [{"value": "no hash"}], 400)
+    write(102, [{"value": "1"}], 400)
     write(99, [{"hash": "stale"}], 400)
     write(-1, [], 400)
     write("101", [], 400)
@@ -839,10 +862,10 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
         truncated.write(b'{"block_number":999,"match_field":["hash"],"documents":[')
     server = start(stack, "searcher", origin, index, origin, ROUTER_CONFIG)
     assert block_number(origin, "transactions") == 101
-    assert cli("searcher", "query", "/v1/transactions/by-hash", '{"id":"c"}', origin)["hits"][0]["value"] == "in memory"
+    assert cli("searcher", "query", "/v1/transactions/by-hash", '{"id":"c"}', origin)["hits"][0]["value"] == "101"
     assert wal.read_bytes().endswith(b"\n")
-    write(101, [{"hash": "c", "value": "extra part"}], 400)
-    write(102, [{"hash": "c", "value": "updated"}])
+    write(101, [{"hash": "c", "value": "2"}], 400)
+    write(102, [{"hash": "c", "value": "102"}])
     assert not wal.exists()
     server.kill()
     server.wait(timeout=10)
@@ -855,7 +878,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as work, ExitStack() as stack:
     server.wait(timeout=10)
     server = start(stack, "searcher", origin, index, origin, ROUTER_CONFIG)
     assert public_height(origin) == 105
-    assert cli("searcher", "query", "/v1/transactions/by-hash", '{"id":"c"}', origin)["hits"][0]["value"] == "updated"
+    assert cli("searcher", "query", "/v1/transactions/by-hash", '{"id":"c"}', origin)["hits"][0]["value"] == "102"
     max_height = (1 << 64) - 1
     write(max_height, [{"hash": "x"}, {"hash": "y"}])
     assert public_height(origin) == max_height

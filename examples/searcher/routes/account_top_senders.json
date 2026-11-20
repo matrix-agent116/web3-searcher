@@ -1,0 +1,17 @@
+{
+  "path": "/v1/account/top-senders",
+  "table": "transactions",
+  "query": {
+    "lucene": "to:${address}",
+    "select": {
+      "sender": "from",
+      "transfer_count": {"op": "count", "field": "*"}
+    },
+    "group_by": ["from"],
+    "order_by": [
+      {"field": "transfer_count", "direction": "desc"},
+      {"field": "sender", "direction": "asc"}
+    ],
+    "limit": 10
+  }
+}

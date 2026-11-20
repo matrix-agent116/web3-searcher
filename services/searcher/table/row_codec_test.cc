@@ -40,11 +40,8 @@ TEST(RowCodecTest, StoredRowsRoundTripWithNestedTypesNullsAndEscaping) {
   const auto first = irs::doc_limits::min();
   EXPECT_TRUE(ReadColumn(disk[0], first, 2, metadata).IsNull());
   simdjson::dom::parser output;
-  auto row = output.parse(ReadRow(StoredFields(schema), disk[0], first + 1))
-                 .get_object()
-                 .value();
-  EXPECT_EQ(row["key"].error(), simdjson::NO_SUCH_FIELD);
-  auto object = row["metadata"].get_object().value();
+  const auto text = JsonValue(ReadColumn(disk[0], first + 1, 2, metadata));
+  auto object = output.parse(text).get_object().value();
   EXPECT_TRUE(object["enabled"].get_bool().value());
   auto labels = object["labels"].get_array().value();
   ASSERT_EQ(labels.size(), 2);

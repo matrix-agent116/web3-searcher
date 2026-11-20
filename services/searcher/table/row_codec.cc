@@ -81,6 +81,8 @@ Value Convert(Json json, const LogicalType& type) {
   return Value(std::move(text)).DefaultCastAs(type, true);
 }
 
+}  // namespace
+
 std::string JsonValue(const duckdb::Value& value) {
   using duckdb::LogicalTypeId;
   if (value.IsNull()) {
@@ -123,8 +125,6 @@ std::string JsonValue(const duckdb::Value& value) {
   return Quote(text);
 }
 
-}  // namespace
-
 duckdb::Value ReadColumn(const irs::SubReader& segment, irs::doc_id_t id,
                          irs::field_id field, const duckdb::LogicalType& type) {
   auto* columns = segment.GetColReader();
@@ -150,28 +150,13 @@ std::vector<const Field*> StoredFields(
     return fields;
   }
   for (auto name : names) {
-    auto field = std::ranges::find(schema.fields, name, &Field::name);
-    if (field == schema.fields.end() || !field->stored)
-      throw std::invalid_argument("unknown stored field: " + std::string(name));
-    if (std::ranges::find(fields, &*field) != fields.end())
+    const auto& field = schema.StoredField(name);
+    if (std::ranges::find(fields, &field) != fields.end())
       throw std::invalid_argument("duplicate selected field: " +
                                   std::string(name));
-    fields.push_back(&*field);
+    fields.push_back(&field);
   }
   return fields;
-}
-
-std::string ReadRow(std::span<const Field* const> fields,
-                    const irs::SubReader& segment, irs::doc_id_t id) {
-  std::string row = "{";
-  for (const Field* field : fields) {
-    if (row.size() > 1) {
-      row += ',';
-    }
-    row += Quote(field->name) + ":" +
-           JsonValue(ReadColumn(segment, id, field->id, field->type));
-  }
-  return row + "}";
 }
 
 duckdb::Value InputValue(simdjson::dom::object object, const Field& field) {

@@ -35,6 +35,7 @@ struct TableSchema {
   std::uint64_t flush_docs = 14'400;
   std::uint64_t merge_segments = 16;
   std::map<std::string, irs::field_id, std::less<>> leaves;
+  const Field& StoredField(std::string_view name) const;
   std::vector<irs::field_id> MatchFields(simdjson::dom::array names) const;
   irs::field_id ExactTerm(const Field& field) const;
 };

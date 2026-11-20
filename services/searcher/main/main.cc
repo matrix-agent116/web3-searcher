@@ -28,9 +28,9 @@ int main(int argc, char** argv) {
     if (command == "build")
       return web3::PrintResponse({200, manager.EnsureTables()});
 
+    manager.EnsureTables();
     auto routes = web3::searcher::InternalRoutes(manager);
     if (argc == 5) web3::searcher::LoadRoutes(argv[4], manager, routes);
-    manager.EnsureTables();
     manager.StartMerger();
     web3::ThreadPool pool(web3::CpuCoreCount());
     web3::ServeRoutes(argv[3], routes, pool);

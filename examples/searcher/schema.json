@@ -9,7 +9,7 @@
         {"name": "from", "type": "VARCHAR", "stored": true, "indexed": true},
         {"name": "to", "type": "VARCHAR", "stored": true, "indexed": true},
         {"name": "blockNumber", "type": "VARCHAR", "stored": true, "indexed": true},
-        {"name": "value", "type": "VARCHAR", "stored": true, "indexed": false}
+        {"name": "value", "type": "BIGNUM", "stored": true, "indexed": false}
       ]
     },
     {

@@ -15,6 +15,9 @@
 
 namespace web3::searcher {
 
+class AggregatePlan;
+class RowProjection;
+
 class Table {
  public:
   ~Table();
@@ -30,6 +33,12 @@ class Table {
   std::size_t SubmitCandidate(uint64_t height, simdjson::dom::array fields,
                               simdjson::dom::array documents);
   absl::int128 GetBlockNumber() const;
+  const TableSchema& Schema() const { return solidity_->Schema(); }
+  std::string Aggregate(const AggregatePlan& plan,
+                        std::string_view expression) const;
+  std::string SearchProjected(const RowProjection& projection,
+                              std::string_view expression,
+                              SearchLimit limit) const;
   std::string Search(std::string_view expression,
                      std::span<const std::string_view> fields = {},
                      SearchLimit limit = {}) const;

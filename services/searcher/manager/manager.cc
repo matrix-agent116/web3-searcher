@@ -61,6 +61,23 @@ std::size_t Manager::SubmitCandidate(std::string_view name, uint64_t height,
   return GetTable(name).SubmitCandidate(height, fields, documents);
 }
 
+const TableSchema& Manager::Schema(std::string_view table) const {
+  return GetTable(table).Schema();
+}
+
+std::string Manager::Aggregate(std::string_view table,
+                               const AggregatePlan& plan,
+                               std::string_view expression) const {
+  return GetTable(table).Aggregate(plan, expression);
+}
+
+std::string Manager::SearchProjected(std::string_view name,
+                                     const RowProjection& projection,
+                                     std::string_view expression,
+                                     SearchLimit limit) const {
+  return GetTable(name).SearchProjected(projection, expression, limit);
+}
+
 std::string Manager::Search(std::string_view name, std::string_view expression,
                             std::span<const std::string_view> fields,
                             SearchLimit limit) const {

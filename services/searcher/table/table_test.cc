@@ -219,6 +219,22 @@ TEST_F(TableTest, AuthoritativeBlockCanInvalidateAmbiguousLaterCandidate) {
   EXPECT_EQ(Values("updated"), (std::vector<std::string>{"new"}));
 }
 
+TEST_F(TableTest, AppendingUsesRebasedViewAndRejectsWholeAmbiguousBlock) {
+  Write(true, 1, R"([{"id":"a","tag":"old"}])");
+  Write(true, 2, R"([{"id":"b","tag":"shared","value":"pending"}])");
+  Write(false, 1, R"([{"id":"a","tag":"shared","value":"final"}])");
+  EXPECT_THROW(
+      Write(true, 3, R"([{"id":"c","tag":"extra"},{"id":"d","tag":"shared"}])",
+            R"(["tag"])"),
+      AmbiguousMatch);
+  EXPECT_TRUE(Values("extra").empty());
+  Write(true, 3, R"([{"id":"b","tag":"new","value":"replacement"}])");
+  EXPECT_EQ(Values("shared"), (std::vector<std::string>{"final"}));
+  EXPECT_EQ(Values("new"), (std::vector<std::string>{"replacement"}));
+  EXPECT_TRUE(Values("old").empty());
+  EXPECT_EQ(table_->GetBlockNumber(), 1);
+}
+
 TEST_F(TableTest, DiskCompactionPreservesCandidatePatchesUntilConfirmation) {
   using namespace std::chrono_literals;
   Write(false, 1,

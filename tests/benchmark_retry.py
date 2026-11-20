@@ -86,6 +86,8 @@ with ThreadingHTTPServer(("127.0.0.1", 0), Indexer) as server:
                                  capture_output=True, text=True, timeout=10)
             if case in ("retry", "lost", "race"):
                 assert run.returncode == 0, (case, run.stderr)
+                assert not any(line.startswith("round=") for line in run.stderr.splitlines())
+                assert "query_summary type=hash requests=1 " in run.stderr, run.stderr
                 report = json.loads(run.stdout)
                 assert report["candidate"]["requests"] == report["solidity"]["requests"] == report["search"]["requests"] == 1
                 assert report["transactions"] == 2 and report["first_block"] == report["last_block"] == 21

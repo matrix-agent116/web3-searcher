@@ -19,6 +19,9 @@
 namespace web3::searcher {
 
 class Table;
+struct TableSchema;
+class AggregatePlan;
+class RowProjection;
 class SegmentMerger;
 
 class Manager {
@@ -38,6 +41,13 @@ class Manager {
   std::size_t SubmitCandidate(std::string_view table, uint64_t block_number,
                               simdjson::dom::array fields,
                               simdjson::dom::array documents);
+  const TableSchema& Schema(std::string_view table) const;
+  std::string Aggregate(std::string_view table, const AggregatePlan& plan,
+                        std::string_view expression) const;
+  std::string SearchProjected(std::string_view table,
+                              const RowProjection& projection,
+                              std::string_view expression,
+                              SearchLimit limit) const;
   std::string Search(std::string_view table, std::string_view expression,
                      std::span<const std::string_view> fields,
                      SearchLimit limit) const;

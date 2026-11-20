@@ -22,12 +22,11 @@ void InsertRow(irs::IndexWriter::Transaction& batch, const TableSchema& schema,
                std::span<const irs::field_id> match_fields = {},
                bool columns_only = false);
 
+std::string JsonValue(const duckdb::Value& value);
 duckdb::Value ReadColumn(const irs::SubReader& segment, irs::doc_id_t id,
                          irs::field_id field, const duckdb::LogicalType& type);
 std::vector<const Field*> StoredFields(
     const TableSchema& schema, std::span<const std::string_view> names = {});
-std::string ReadRow(std::span<const Field* const> fields,
-                    const irs::SubReader& segment, irs::doc_id_t id);
 
 }  // namespace web3::searcher
 

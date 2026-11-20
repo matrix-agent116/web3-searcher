@@ -34,17 +34,15 @@ TEST(QueryTemplateTest, BindsTypedGetAndJsonPointerPostToTheSameQuery) {
                std::invalid_argument);
 }
 
-TEST(QueryTemplateTest, SelectDeduplicatesColumnsAndPreservesJsonTypes) {
+TEST(QueryTemplateTest, RejectsDuplicateOutputAliases) {
   simdjson::dom::parser parser;
-  QueryTemplate query_template(
-      Parse(parser, R"({"query":{"lucene":"*:*","select":{
-    "a":"payload","b":"payload","c":"note"}}})"));
-  EXPECT_EQ(query_template.Fields(),
-            (std::vector<std::string_view>{"payload", "note"}));
-  auto response = query_template.Response(Parse(
-      parser, R"([{"payload":[{"n":1}],"note":null,"private":"hidden"}])"));
-  EXPECT_EQ(response,
-            R"({"ok":true,"hits":[{"a":[{"n":1}],"b":[{"n":1}],"c":null}]})");
+  EXPECT_THROW(
+      {
+        QueryTemplate query_template(Parse(
+            parser,
+            R"({"query":{"lucene":"*:*","select":{"a":"value","a":"hash"}}})"));
+      },
+      std::invalid_argument);
 }
 
 TEST(QueryTemplateTest, RejectsMisplacedOrInvalidPlaceholders) {

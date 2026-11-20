@@ -7,6 +7,9 @@
 #include <set>
 #include <stdexcept>
 
+#include "searcher/config/schema.h"
+#include "searcher/table/lucene_query.h"
+
 namespace web3::searcher {
 namespace {
 
@@ -56,14 +59,24 @@ bool TermEnd(char c) {
 
 }  // namespace
 
-QueryTemplate::QueryTemplate(Json route) {
+QueryTemplate::QueryTemplate(
+    Json route, std::function<const TableSchema&()> resolve_schema) {
   auto parameters = route["params"];
   const bool infer_params = parameters.error() == simdjson::NO_SUCH_FIELD;
   if (!infer_params) ReadParameters(parameters.get_object().value());
   const auto query_template = route["query"].value();
   limit_ = SearchLimit::FromJson(query_template);
   Compile(query_template["lucene"].get_string().value(), infer_params);
-  ReadSelection(query_template["select"].get_object().value());
+  if (AggregatePlan::Required(query_template)) {
+    if (!resolve_schema)
+      throw std::invalid_argument("aggregate route requires a schema");
+    const auto& schema = resolve_schema();
+    aggregate_.emplace(query_template, limit_, schema);
+    ParseLuceneQuery(schema, ValidationExpression());
+  } else {
+    ReadSelection(query_template["select"].get_object().value(),
+                  resolve_schema);
+  }
 }
 
 void QueryTemplate::ReadParameters(simdjson::dom::object params) {
@@ -137,19 +150,32 @@ void QueryTemplate::Compile(std::string_view expression, bool infer_params) {
   parts_.emplace_back(std::string(expression.substr(start)));
 }
 
-void QueryTemplate::ReadSelection(simdjson::dom::object selection) {
+void QueryTemplate::ReadSelection(
+    simdjson::dom::object selection,
+    const std::function<const TableSchema&()>& resolve_schema) {
   std::set<std::string_view> aliases;
-  std::set<std::string> columns;
   for (auto [alias, field] : selection) {
-    const std::string name(field.get_string().value());
-    if (alias.empty() || name.empty() || !aliases.insert(alias).second)
+    if (alias.empty() || field.get_string().value().empty() ||
+        !aliases.insert(alias).second)
       throw std::invalid_argument("invalid query projection");
-    select_.push_back(
-        {(select_.empty() ? "" : ",") + Quote(alias) + ":", name});
-    if (columns.insert(name).second) columns_.push_back(name);
   }
-  if (select_.empty())
+  if (aliases.empty())
     throw std::invalid_argument("select must contain at least one field");
+  if (!resolve_schema) return;
+  // Ordinary routes report an unavailable table/column at request time.
+  try {
+    const auto& schema = resolve_schema();
+    projection_.emplace();
+    for (auto [alias, field] : selection)
+      projection_->Add(schema.StoredField(field.get_string().value()), alias);
+  } catch (const std::invalid_argument&) {
+    projection_.reset();
+  }
+}
+
+const RowProjection& QueryTemplate::Projection() const {
+  if (!projection_) throw std::runtime_error("unavailable route projection");
+  return *projection_;
 }
 
 std::string QueryTemplate::Param::Bind(Json input, bool get) const {
@@ -198,27 +224,13 @@ std::string QueryTemplate::Bind(Json input, bool get) const {
   return query;
 }
 
-std::vector<std::string_view> QueryTemplate::Fields() const {
-  return {columns_.begin(), columns_.end()};
-}
-
-std::string QueryTemplate::Response(Json hits) const {
-  std::string result = R"({"ok":true,"hits":[)";
-  bool first = true;
-  for (auto row : hits.get_array().value()) {
-    if (!first) result += ',';
-    first = false;
-    result += '{';
-    for (const auto& [key, column] : select_) {
-      auto value = simdjson::minify(row[column].value());
-      if (result.size() + key.size() + value.size() + 3 > kMaxHttpBodyBytes)
-        throw std::length_error("response too large");
-      result += key;
-      result += value;
-    }
-    result += '}';
+std::string QueryTemplate::ValidationExpression() const {
+  std::string expression;
+  for (const auto& part : parts_) {
+    const auto* literal = std::get_if<std::string>(&part);
+    expression += literal ? *literal : "0";
   }
-  return result + "]}";
+  return expression;
 }
 
 }  // namespace web3::searcher

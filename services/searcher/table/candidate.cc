@@ -12,18 +12,31 @@ Candidate::Candidate(duckdb::DatabaseInstance& database,
     : schema_(schema), writer_(MakeIndexWriter(directory_, database)) {}
 
 std::shared_ptr<const Snapshot> Candidate::Replace(
-    const Snapshot& confirmed, uint64_t height, simdjson::dom::array fields,
+    const Snapshot& confirmed, std::shared_ptr<const Snapshot> published,
+    uint64_t height, simdjson::dom::array fields,
     simdjson::dom::array documents) {
   const auto match = schema_.MatchFields(fields);
-  auto next = blocks_;
+  std::optional<MemorySegment> block;
   if (documents.size() == 0) {
-    next.erase(height);
+    if (!blocks_.contains(height)) return published;
   } else {
     // Candidates can be rebased on a different predecessor. Keep complete rows.
     const std::vector<uint8_t> full_rows(documents.size(), 0);
-    next.insert_or_assign(height,
-                          MemorySegment::Build(0, *writer_, schema_,
-                                               {documents, match, full_rows}));
+    block = MemorySegment::Build(0, *writer_, schema_,
+                                 {documents, match, full_rows});
+    if (blocks_.empty() || height > blocks_.rbegin()->first) {
+      // The published view already contains every eligible predecessor.
+      auto view = std::make_shared<Snapshot>(*published);
+      view->ApplySegments(schema_, view->NextOrdinal(), {&block->reader, 1});
+      blocks_.emplace_hint(blocks_.end(), height, std::move(*block));
+      return view;
+    }
+  }
+  auto next = blocks_;
+  if (block) {
+    next.insert_or_assign(height, std::move(*block));
+  } else {
+    next.erase(height);
   }
   auto view = Compose(confirmed, next, height);
   blocks_.swap(next);

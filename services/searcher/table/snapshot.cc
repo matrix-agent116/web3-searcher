@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <duckdb/common/vector/flat_vector.hpp>
 #include <iresearch/formats/column/col_reader.hpp>
+#include <iresearch/formats/term_reader.hpp>
 #include <iresearch/index/doc_removal.hpp>
 #include <iresearch/index/document_mask.hpp>
 #include <iresearch/index/merge_writer.hpp>
@@ -39,7 +40,7 @@
 #include <utility>
 
 #include "common/http.h"
-#include "searcher/table/lucene_query.h"
+#include "searcher/query/row_scan.h"
 #include "searcher/table/memory_segment.h"
 #include "searcher/table/row_codec.h"
 
@@ -85,27 +86,45 @@ std::optional<RowId> FindMatch(const TableSchema& schema,
                                const std::vector<std::string>& values,
                                irs::doc_id_t before = irs::doc_limits::eof(),
                                const std::set<RowId>* removed = nullptr) {
+  std::optional<irs::field_id> single_field;
+  irs::bytes_view term;
   irs::BooleanFilter filter;
-  for (size_t i = 0; i < fields.size(); ++i) {
-    filter.Add({.field = schema.ExactTerm(schema.fields[fields[i] - 1]),
-                .dict = irs::StringLayout::kStrings,
-                .term = irs::bstring{irs::ViewCast<irs::byte_type>(
-                    std::string_view(values[i]))}},
-               irs::Occur::Must);
+  if (fields.size() == 1) {
+    single_field = schema.ExactTerm(schema.fields[fields.front() - 1]);
+    term = irs::ViewCast<irs::byte_type>(std::string_view(values.front()));
+  } else {
+    for (size_t i = 0; i < fields.size(); ++i) {
+      filter.Add({.field = schema.ExactTerm(schema.fields[fields[i] - 1]),
+                  .dict = irs::StringLayout::kStrings,
+                  .term = irs::bstring{irs::ViewCast<irs::byte_type>(
+                      std::string_view(values[i]))}},
+                 irs::Occur::Must);
+    }
   }
   std::optional<RowId> hit;
   for (auto it = segments.rbegin(); it != segments.rend(); ++it) {
     const auto limit = std::exchange(before, irs::doc_limits::eof());
-    auto query = filter.PrepareSegment(it->reader, {});
-    auto plan = query ? query->PlanLead({}) : nullptr;
-    if (!plan) continue;
     const auto* mask = it->reader.docs_mask();
-    for (auto id = plan->Next(); id < limit; id = plan->Next()) {
+    auto accept = [&](irs::doc_id_t id) {
+      if (id >= limit) return false;
       RowId row{it->ordinal, id};
       if ((mask && mask->Contains(id)) || (removed && removed->contains(row)))
-        continue;
+        return true;
       if (hit) throw AmbiguousMatch();
       hit = row;
+      return true;
+    };
+    if (single_field) {
+      if (auto* terms =
+              it->reader.field(*single_field, irs::StringLayout::kStrings))
+        terms->ReadDocs(term, accept);
+    } else {
+      auto query = filter.PrepareSegment(it->reader, {});
+      auto plan = query ? query->PlanLead({}) : nullptr;
+      if (plan) {
+        while (accept(plan->Next())) {
+        }
+      }
     }
   }
   return hit;
@@ -405,32 +424,10 @@ std::string Snapshot::Search(const TableSchema& schema,
                              std::string_view expression,
                              std::span<const std::string_view> fields,
                              SearchLimit limit) const {
-  auto columns = StoredFields(schema, fields);
-  auto filter = ParseLuceneQuery(schema, expression);
-  std::string result = R"({"ok":true,"hits":[)";
-  constexpr std::string_view kEnd = "]}";
-  std::size_t count = 0;
-  for (const auto& entry : Segments()) {
-    if (count == limit.value()) break;
-    const auto& segment = entry.reader;
-    auto query = filter->PrepareSegment(segment, {});
-    auto plan = query ? query->PlanLead({}) : nullptr;
-    if (!plan) {
-      continue;
-    }
-    for (auto id = plan->Next(); !irs::doc_limits::eof(id); id = plan->Next()) {
-      if (auto* mask = segment.docs_mask(); mask && mask->Contains(id))
-        continue;
-      if (count != 0) result += ',';
-      auto row = ReadRow(columns, segment, id);
-      if (row.size() + result.size() + kEnd.size() > kMaxHttpBodyBytes)
-        throw std::length_error("search response exceeds 16 MiB");
-      result += row;
-      if (++count == limit.value()) break;
-    }
-  }
-  result += kEnd;
-  return result;
+  RowProjection projection;
+  for (auto* field : StoredFields(schema, fields))
+    projection.Add(*field, field->name);
+  return projection.Search(*this, schema, expression, limit);
 }
 
 }  // namespace web3::searcher

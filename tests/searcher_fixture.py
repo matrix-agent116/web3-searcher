@@ -2,27 +2,33 @@
 
 import json
 from contextlib import ExitStack
+from unittest import TestCase
 
 from service_process import endpoints, http_request, start_service
 
 
 class Searcher:
     def __init__(self, binary, index, stack, *, indexed=("hash", "from"),
-                 flush_docs=2, merge_segments=16):
+                 flush_docs=2, merge_segments=16, router_config=None, extra_fields=()):
         fields = [{"name": name, "type": "VARCHAR", "stored": True, "indexed": True}
                   for name in indexed]
         fields.append({"name": "value", "type": "VARCHAR", "stored": True, "indexed": False})
+        fields.extend(extra_fields)
         table = {"name": "transactions", "fields": fields,
                  "flush_docs": flush_docs, "merge_segments": merge_segments}
         (index / "schema.json").write_text(json.dumps({"tables": [table]}))
         self.origin, = endpoints(1)
         self.binary = binary
         self.index = index
+        self.router_config = router_config
         self.process_stack = stack.enter_context(ExitStack())
         self.server = self._start()
 
     def _start(self):
-        return start_service(self.process_stack, self.binary, self.origin, self.index, self.origin)
+        args = [self.index, self.origin]
+        if self.router_config is not None:
+            args.append(self.router_config)
+        return start_service(self.process_stack, self.binary, self.origin, *args)
 
     def crash_and_reopen(self):
         self.server.kill()
@@ -52,9 +58,5 @@ class Searcher:
 
     def expect_hits(self, expression, *expected):
         hits = self.post("/search", {"query": expression})["hits"]
-        # Order is unspecified. Preserve duplicates and compare every stored field.
-        def row_key(row):
-            return json.dumps(row, sort_keys=True)
-
-        assert sorted(hits, key=row_key) == sorted(expected, key=row_key), (
-            expression, "expected", expected, "actual", hits)
+        # Keep multiplicity and compare decoded values, including 0 and 0.0.
+        TestCase().assertCountEqual(hits, expected, msg=expression)

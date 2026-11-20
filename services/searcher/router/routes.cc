@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "searcher/manager/manager.h"
+#include "searcher/query/aggregate/session.h"
 #include "searcher/query/query_template.h"
 
 namespace web3::searcher {
@@ -25,11 +26,13 @@ struct Route {
       if (!query_template)
         return {200, absl::StrCat(R"({"ok":true,"block_number":)",
                                   manager.GetBlockNumber(table), "}")};
-      auto reply = manager.Search(table, query, query_template->Fields(),
-                                  query_template->Limit());
-      simdjson::dom::parser parser;
-      return {200,
-              query_template->Response(parser.parse(reply)["hits"].value())};
+      if (const auto& plan = query_template->Aggregate())
+        return {200, manager.Aggregate(table, *plan, query)};
+      return {200, manager.SearchProjected(table, query_template->Projection(),
+                                           query, query_template->Limit())};
+    } catch (const AggregateUnavailable&) {
+      return {503,
+              R"({"ok":false,"error":"aggregate resource limit exceeded"})"};
     } catch (const std::length_error&) {
       return {413, R"({"ok":false,"error":"response too large"})"};
     } catch (const std::exception&) {
@@ -52,7 +55,9 @@ void AddRoute(Json spec, const Manager& manager, HttpRoutes& routes) {
   auto operation = spec["operation"];
   if (operation.error() == simdjson::NO_SUCH_FIELD ||
       operation.get_string().value() == "search") {
-    route->query_template.emplace(spec);
+    route->query_template.emplace(spec, [&]() -> const TableSchema& {
+      return manager.Schema(route->table);
+    });
   } else if (operation.get_string().value() != "block_number" ||
              spec["query"].error() != simdjson::NO_SUCH_FIELD ||
              spec["params"].error() != simdjson::NO_SUCH_FIELD) {
@@ -108,8 +113,7 @@ void LoadRoutes(const std::filesystem::path& config, const Manager& manager,
   }
   if (manifest.bad())
     throw std::runtime_error("cannot read route list: " + config.string());
-  if (!loaded)
-    throw std::invalid_argument("no routes in " + config.string());
+  if (!loaded) throw std::invalid_argument("no routes in " + config.string());
 }
 
 }  // namespace web3::searcher

@@ -5,6 +5,7 @@ import os
 import random
 import sys
 import tempfile
+from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -55,6 +56,21 @@ class Model:
         searcher.expect_hits("(chain:eth AND from:alice) OR hash:tx0",
                             *(row for row in rows if (row["chain"] == "eth" and row["from"] == "alice")
                               or row["hash"] == "tx0"))
+        groups = Counter((row["from"], row["value"]) for row in rows)
+        expected = sorted(groups, key=lambda key: (-groups[key], key[0], key[1] is None, key[1]))
+        hits = searcher.post("/groups", {})["hits"]
+        assert hits == [{"sender": sender, "v": value, "n": groups[sender, value]}
+                        for sender, value in expected[:3]], hits
+        amounts = [row["amount"] for row in rows if row["amount"] is not None]
+        expected_stats = {"count": len(amounts), "sum": sum(amounts) if amounts else None,
+                          "avg": sum(amounts) / len(amounts) if amounts else None,
+                          "min": min(amounts, default=None), "max": max(amounts, default=None)}
+        stats = searcher.post("/stats", {})["hits"]
+        assert stats == [expected_stats], (stats, expected_stats)
+        assert searcher.post("/count-all", {})["hits"] == [{"n": len(rows)}]
+        for sender in SENDERS:
+            n = sum(row["from"] == sender for row in rows)
+            assert searcher.post("/count", {"sender": sender})["hits"] == [{"n": n}]
 
 
 def make_batch(rng, model):
@@ -70,6 +86,7 @@ def make_batch(rng, model):
             row = {"hash": rng.choice(HASHES), "chain": rng.choice(CHAINS),
                    "from": rng.choice(SENDERS)}
         row["value"] = rng.choice([None, "", 'quoted "value"\n', str(rng.randrange(10000))])
+        row["amount"] = rng.choice((None, 0, rng.randint(-10000, 10000) / 4))
         batch.append(row)
     return batch
 
@@ -118,8 +135,26 @@ def run(binary, seed, steps):
     model = Model(fields)
     print(f"searcher_fuzz seed={seed} steps={steps} match_fields={fields}", flush=True)
     with tempfile.TemporaryDirectory() as work, ExitStack() as stack:
-        searcher = Searcher(binary, Path(work), stack, indexed=("hash", "chain", "from"),
-                          flush_docs=5, merge_segments=3)
+        root = Path(work)
+        route = {"path": "/groups", "table": "transactions", "query": {
+            "lucene": "*:*", "select": {"sender": "from", "v": "value", "n": {"op": "count", "field": "*"}},
+            "group_by": ["from", "value"], "limit": 3,
+            "order_by": [{"field": "n", "direction": "desc"}, {"field": "sender", "direction": "asc"},
+                         {"field": "v", "direction": "asc"}]}}
+        (root / "groups.json").write_text(json.dumps(route))
+        stats = {"path": "/stats", "table": "transactions", "query": {
+            "lucene": "*:*", "select": {op: {"op": op, "field": "amount"}
+                                       for op in ("count", "sum", "avg", "min", "max")}}}
+        (root / "stats.json").write_text(json.dumps(stats))
+        config = root / "router.conf"
+        for name, expression in (("count-all", "*:*"), ("count", "from:${sender}")):
+            route = {"path": "/" + name, "table": "transactions", "query": {
+                "lucene": expression, "select": {"n": {"op": "count", "field": "*"}}}}
+            (root / (name + ".json")).write_text(json.dumps(route))
+        config.write_text("groups.json\nstats.json\ncount-all.json\ncount.json\n")
+        searcher = Searcher(binary, root, stack, indexed=("hash", "chain", "from"),
+                            flush_docs=5, merge_segments=3, router_config=config,
+                            extra_fields=[{"name": "amount", "type": "DOUBLE", "stored": True, "indexed": False}])
         model.check(searcher)
         for step, (path, height, rows) in enumerate(operations(rng, model, steps), start=1):
             try:

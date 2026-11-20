@@ -1,0 +1,15 @@
+{
+  "path": "/v1/account/received-stats",
+  "table": "transactions",
+  "query": {
+    "lucene": "to:${address}",
+    "select": {
+      "transfer_count": {"op": "count", "field": "*"},
+      "value_count": {"op": "count", "field": "value"},
+      "total_wei": {"op": "sum", "field": "value"},
+      "average_wei": {"op": "avg", "field": "value"},
+      "min_wei": {"op": "min", "field": "value"},
+      "max_wei": {"op": "max", "field": "value"}
+    }
+  }
+}

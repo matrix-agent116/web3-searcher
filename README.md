@@ -14,11 +14,11 @@ ctest --test-dir build --output-on-failure
 
 运行全部存储组件单元测试可以用 `ctest --test-dir build -L table --output-on-failure`。单独验证 WAL 可用 `ctest --test-dir build -R '^update_log_test$' --output-on-failure`。
 
-路由和表管理器的单元测试直接调用 handler 和 Manager，在临时目录建表。运行这两组测试可用 `ctest --test-dir build -R '^(router|manager)_test$' --output-on-failure`。
+路由和表管理器的单元测试直接调用 handler 和 Manager，在临时目录建表。运行这些测试可用 `ctest --test-dir build -R '^(routes|internal_routes|manager)_test$' --output-on-failure`。
 
 运行 searcher 端到端测试可用 `ctest --test-dir build -R '^searcher_storage_e2e$' --output-on-failure`。测试在临时目录和本机动态端口启动真实 searcher，通过 HTTP 验证 16 块延迟下候选高度 0–17 的查询可见性和固化高度、候选块替换、整块提交失败时的回滚、固化块覆盖，以及进程被终止后从 WAL 和磁盘检查点恢复。
 
-仓库根目录下的 `e2e/` 存放固定场景，`fuzz/` 存放状态机随机测试。`ctest --test-dir build -L e2e --output-on-failure` 运行 searcher 存储、公开路由的端到端测试和随机测试，用 `-L fuzz` 可单独运行随机测试。随机测试默认使用 3 个固定种子。每个种子先按 16 块延迟推进，随机生成区块数据和候选替换，并在固化窗口内强制重启。随后执行 64 步随机操作，最后再次重启。每一步都按独立模型核对固化高度、哈希和其他索引字段的命中结果。可用下面的命令指定种子和步数，或设置 `SEARCHER_FUZZ_SEED=random` 探索新序列。失败日志包含实际种子、失败步骤和复现命令。
+仓库根目录下的 `e2e/` 存放固定场景，`fuzz/` 存放状态机随机测试。`ctest --test-dir build -L e2e --output-on-failure` 运行 searcher 存储、公开路由的端到端测试和随机测试，用 `-L fuzz` 可单独运行随机测试。随机测试默认使用 3 个固定种子。每个种子先按 16 块延迟推进，随机生成区块数据和候选替换，并在固化窗口内强制重启。随后执行 64 步随机操作，最后再次重启。每一步都按独立模型核对固化高度、哈希、其他索引字段的命中结果及分组计数的前三名。可用下面的命令指定种子和步数，或设置 `SEARCHER_FUZZ_SEED=random` 探索新序列。失败日志包含实际种子、失败步骤和复现命令。
 
 ```sh
 SEARCHER_FUZZ_SEED=42 SEARCHER_FUZZ_STEPS=200 ctest --test-dir build -R '^searcher_e2e_fuzz$' --output-on-failure
@@ -84,7 +84,7 @@ searcher 的内置和配置路由共用一个表管理器和一个线程池。�
 
 - `POST /candidate` 提交候选块。同高度的新块整块替换旧块，更高的候选块保留并按高度顺序应用。已固化高度及以下的迟到候选块返回成功，`upserted` 为 0。候选块仅驻留内存，重启后可由上游重送。
 - `POST /solidity` 固化完整区块。新高度必须严格大于当前固化高度，可以跳过高度。重复或回退的高度返回 HTTP 400。写入成功后，查询一次性切换到新的固化数据和所有更高的候选块。固化失败保留原查询视图。较高候选块的匹配键如果在新视图中变得不唯一，该候选块整体暂缓展示，后续替换或固化会重新计算。
-- `POST /search` 只取得一次已发布快照。每张表的后台线程在候选块替换、固化和重载时构建查询视图，磁盘合并线程按当前版本转换已有视图。每次构建有独立的版本号，同高度替换也会产生新版本。重建期间仍可读取旧快照，固化数据可恢复且新快照发布后，固化请求才返回成功。`POST /block_number` 返回这张表最新的固化高度，新表返回 `-1`，固化区块 `0` 后返回 `0`。
+- `POST /search` 只取得一次已发布快照。按高度追加候选块时，后台线程在当前查询快照上应用新块。替换或乱序插入候选块、固化或重载时，按高度在固化快照上重新应用剩余候选块。磁盘合并线程按当前版本转换已有视图。每次构建有独立的版本号，同高度替换也会产生新版本。重建期间仍可读取旧快照，固化数据可恢复且新快照发布后，固化请求才返回成功。`POST /block_number` 返回这张表最新的固化高度，新表返回 `-1`，固化区块 `0` 后返回 `0`。
 
 ### Searcher 路由
 
@@ -92,6 +92,8 @@ searcher 启动时读取 `examples/searcher/router.conf`。清单每行是一个
 
 ```text
 routes/account_transfers.json
+routes/account_top_senders.json
+routes/account_received_stats.json
 routes/transaction_by_hash.json
 routes/chain_height.json
 ```
@@ -116,11 +118,31 @@ routes/chain_height.json
 
 路由的 `query.limit` 指定最多返回多少条记录，默认 100，允许 1 到 65535 的整数。searcher 启动时校验该配置，GET 和 POST 均使用路由配置的上限。
 
+配置路由支持 `COUNT`、`SUM`、`AVG`、`MIN`、`MAX`、分组和排序。示例 [account_top_senders.json](examples/searcher/routes/account_top_senders.json) 按收款地址过滤，返回交易笔数最多的 10 个发送地址。可用 `GET /v1/account/top-senders?address=0x…` 或 POST 同一 URL 并传入 `{"address":"0x…"}`。成功响应沿用 `hits` 数组，例如 `{"ok":true,"hits":[{"sender":"0xaa","transfer_count":12}]}`。
+
+[account_received_stats.json](examples/searcher/routes/account_received_stats.json) 定义了 `GET /v1/account/received-stats?address=0x…`，也支持 POST。它对发往该地址的可见交易统计笔数、有金额的笔数，以及以 wei 为单位的总额、均值和最小、最大金额。
+
+| `query.select` 配置 | 含义 |
+| --- | --- |
+| `{"op":"count","field":"*"}` | 统计所有命中记录。 |
+| `{"op":"count","field":"value"}` | 统计指定已存储字段的非空值，零也计入。 |
+| `{"op":"sum","field":"amount"}` | 对指定列求和。`BIGNUM` 使用精确整数运算。 |
+| `{"op":"avg","field":"amount"}` | `BIGNUM` 返回向零截断的整数平均值，例如 −5 除以 2 得 −2。浮点列返回 `DOUBLE`。 |
+| `{"op":"min","field":"amount"}`、`{"op":"max","field":"amount"}` | 按数值大小取最小值或最大值。 |
+
+- 字段算子忽略 `NULL`。省略 `group_by` 时返回一行。命中为空或字段全为 `NULL` 时，字段计数为 0，其他字段算子返回 JSON `null`。分组查询没有命中时返回空数组。
+- `SUM`、`AVG`、`MIN`、`MAX` 仅接受 schema 中已存储的 `BIGNUM`、`FLOAT` 或 `DOUBLE` 字段，服务启动时校验。`COUNT(field)` 接受任意已存储类型。
+- 示例交易的 `value` 是以 wei 为单位的 `BIGNUM`。写入方将链上 hex 金额转换成十进制整数字符串，例如 `"1000000000000000000"`。该列的明细和四个数值聚合结果均以十进制字符串返回，总和可以超过 256 位。
+- `group_by` 使用顶层已存储字段名，支持多列。带分组或聚合的查询中，每个普通输出列都须出现在分组中。`NULL` 分为一组。
+- `order_by` 使用 `select` 的公开别名和 `asc` 或 `desc`，按配置顺序比较，各列的 `NULL` 排在末尾。同值排序可再指定分组键。省略排序时，返回顺序未指定。
+- 无分组且仅输出 `COUNT(*)` 时，全表查询累加当前快照各段的有效文档数，带 Lucene 条件的查询使用 IResearch 的计数计划。字段聚合通过 IResearch 批量读取命中行的存储列，再由 DuckDB 计算。
+- 每次请求固定一个包含候选块的查询快照。聚合的 `limit` 在分组和排序之后生效，默认 100，最大 65535。聚合和排序共用 2 个执行名额，DuckDB 缓冲内存上限为 256 MiB，查询时限为 30 秒。超过计算预算返回 HTTP 503，响应超过 16 MiB 返回 HTTP 413。
+
 ### Searcher 原始查询
 
 向 searcher 发送 `POST /search`，请求体例如 `{"table":"transactions","query":"from:0x01 OR to:0x01","fields":["hash"],"limit":20}`。省略 `table` 时查询 `transactions`，省略 `fields` 时返回全部已存储字段。显式传入的 `fields` 必须是非空、无重复的已存储字段名数组。Lucene 查询词需要指定已索引字段，`*:*` 匹配全部可见记录。
 
-searcher 同样默认返回最多 100 条，非法 `limit` 返回 HTTP 400。整个快照共用一个上限，累计取得指定条数的可见记录后即停止遍历。返回顺序取决于快照中的遍历顺序。若序列化的响应超过 16 MiB，searcher 停止构建结果并返回 HTTP 413。
+searcher 同样默认返回最多 100 条，非法 `limit` 返回 HTTP 400。整个快照共用一个上限，累计取得指定条数的可见记录后即停止遍历。普通配置路由在启动时绑定存储列和公开别名，直接从查询批次生成最终 JSON。返回顺序取决于快照中的遍历顺序。若序列化的响应超过 16 MiB，searcher 停止构建结果并返回 HTTP 413。
 
 普通字段保留大小写并按完整词项匹配。配置 `analyzer: "text"` 的字段在查询和写入时使用相同的分词规则，支持短语，例如 `description:"sample ethereum"`。已有分词索引需要从源文档重建，才能按词位置匹配短语。范围表达式比较索引词项的字典序，数值字段也使用其文本表示。
 
@@ -163,7 +185,7 @@ wait
 ```sh
 bench_dir=$(mktemp -d)
 cp examples/searcher/{schema,transactions,blocks}.json "$bench_dir/"
-build/bin/searcher serve "$bench_dir" http://127.0.0.1:9411
+build/bin/searcher serve "$bench_dir" http://127.0.0.1:9411 examples/searcher/router.conf
 ```
 
 也可用 `./start_searcher.sh ./benchmark-index` 启动 searcher。启动脚本和压测脚本共用 `SEARCHER_URL`，默认为 `http://127.0.0.1:9411`。可通过 `ROUTER_CONFIG` 指定路由清单。
@@ -175,10 +197,22 @@ build/bin/indexer_benchmark http://127.0.0.1:9411 \
   --blocks 256 --query-threads 4
 ```
 
+默认的 `--query-mode mixed` 依次发起三种读取，所有查询线程共享轮转次序和 `--queries N` 总次数。也可以用 `--query-mode` 选择表中的单个模式。
+
+| 模式 | 请求 | 检查内容 |
+| --- | --- | --- |
+| `hash` | `/search` | 按已发布交易的哈希精确查一笔交易。 |
+| `received_stats` | `/v1/account/received-stats` | 按收款地址读取交易笔数、金额笔数以及 wei 金额的和、均值与极值。 |
+| `top_senders` | `/v1/account/top-senders` | 按收款地址查询交易笔数最多的 10 个发送方，校验数量和排列顺序。 |
+
+两种聚合查询共用最多两个在途请求，与 searcher 的聚合并发名额一致。收款地址从本轮已发布的交易中确定性抽样。如果当前只有收款地址为空的交易，就检查空匹配的返回格式。混合模式和单项聚合模式需要加载示例路由。
+
 默认写入 100 万块，每块 512 笔，共 5.12 亿笔。默认用 1 个查询线程，最后一轮写入完成后停止发起查询，并等待已发出的查询返回。`--queries N` 指定本轮总查询次数，读写各自完成指定的工作量后退出。`--queries 0` 只测写入。多块压测时最多同时发起 63 个查询，为写线程预留 1 个 HTTP 请求名额。示例交易表使用默认刷盘阈值。从空表开始，每块写入 512 笔时，候选高度达到 44 时固化第 29 块（高度 28），累计固化交易数达到 14,848 笔，触发整批刷盘。
 
-压测期间每秒向 stderr 打印候选块数、固化块数、已固化交易数和查询数，以及本采样区间的 `candidates/s`、`blocks/s`、`tx/s` 和 `queries/s`。将 stdout 重定向到文件，终端仍能看到实时进度。
+压测期间每秒向 stderr 打印一组 `progress` 表格。第一张表每行对应一项指标，包括候选块数、固化块数、固化交易数和已完成查询数。`total` 是本轮压测的累计数量，`rate/s` 是最近一个采样区间的每秒吞吐量。第二张表按 `hash`、`received_stats`、`top_senders` 分行显示该区间的 QPS 和平均延迟（`avg_ms`，单位为毫秒）。某类查询在区间内没有完成请求时，平均延迟显示为 `-`。
+
+结束时每种有样本的查询打印一行 `query_summary`，列出全程请求数、QPS 和 P50/P95/P99。不足一秒的短跑也会输出最终统计。stdout 用于完整 JSON 报告。
 
 压测客户端的连接超时为 3 秒，单次 HTTP 请求总超时为 30 秒（含连接时间）。读高度、查询和写入遇到连接中断、未收到响应或 HTTP 408、504 时，最多额外重试 3 次，间隔依次为 100、200、400 毫秒。候选块超时后用同一请求体重试，同高度的候选块整块替换。固化请求超时后先读取固化高度。目标高度已提交时，客户端按哈希核对整批交易的字段。高度尚未提交时，客户端重发同一批数据。一次逻辑请求只计数一次，延迟包含重试、等待和结果核对时间。
 
-程序校验每块的写入条数和返回高度，并检查每次查询恰好命中指定交易。成功后向 stdout 写一条 JSON，失败时以非零状态退出。`first_block` 和 `last_block` 为本轮候选高度，`last_solidity_block` 为最终固化高度。空表只跑前 16 个候选块时，该高度为 `-1`，`solidity` 统计为 `null`。`transactions_per_second` 是整个写入阶段的交易吞吐量，包含客户端生成数据、提交候选块和固化区块的时间，按本轮实际固化的交易数计数。`overlapping_searches` 是客户端观察到与区块写入重叠的查询数，每轮写入从提交候选块开始，到该轮候选提交及到期的固化操作全部完成为止。`candidate` 和 `solidity` 分别报告各自的累计请求耗时、请求数、每秒请求数和 P50、P95、P99 延迟（毫秒）。`search` 汇总所有查询线程，按查询阶段的实际经过时间计算每秒请求数。分位数按延迟直方图估算，取所在桶的上界，向上误差小于 1.6%。`max_ms` 为实测最长请求耗时，`over_1s` 为耗时超过 1 秒的请求数。searcher 在每次成功合并后记录 `publish_lock_us`，单位为微秒，包含最终发布时的清单持久化和快照切换。
+程序校验每块的写入条数和返回高度，并按查询类型检查返回结果。成功后向 stdout 写一条 JSON，失败时以非零状态退出。`first_block` 和 `last_block` 为本轮候选高度，`last_solidity_block` 为最终固化高度。空表只跑前 16 个候选块时，该高度为 `-1`，`solidity` 统计为 `null`。`transactions_per_second` 是整个写入阶段的交易吞吐量，包含客户端生成数据、提交候选块和固化区块的时间，按本轮实际固化的交易数计数。`overlapping_searches` 是客户端观察到与区块写入重叠的查询数，每轮写入从提交候选块开始，到该轮候选提交及到期的固化操作全部完成为止。`candidate` 和 `solidity` 分别报告各自的累计请求耗时、请求数、每秒请求数和 P50、P95、P99 延迟（毫秒）。`search` 汇总所有查询线程，按查询阶段的实际经过时间计算每秒请求数。`query_types` 按三种查询分别报告请求数、吞吐和延迟，无样本的类型为 `null`。各类型吞吐使用同一个查询阶段时长，延迟从客户端取得名额并发起请求时开始计算。分位数按延迟直方图估算，取所在桶的上界，向上误差小于 1.6%。`max_ms` 为实测最长请求耗时，`over_1s` 为耗时超过 1 秒的请求数。searcher 在每次成功合并后记录 `publish_lock_us`，单位为微秒，包含最终发布时的清单持久化和快照切换。

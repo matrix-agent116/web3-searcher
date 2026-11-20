@@ -18,10 +18,10 @@ namespace web3::searcher {
 class Candidate {
  public:
   Candidate(duckdb::DatabaseInstance& database, const TableSchema& schema);
-  std::shared_ptr<const Snapshot> Replace(const Snapshot& confirmed,
-                                          uint64_t height,
-                                          simdjson::dom::array fields,
-                                          simdjson::dom::array documents);
+  std::shared_ptr<const Snapshot> Replace(
+      const Snapshot& confirmed, std::shared_ptr<const Snapshot> published,
+      uint64_t height, simdjson::dom::array fields,
+      simdjson::dom::array documents);
   std::shared_ptr<const Snapshot> Overlay(const Snapshot& confirmed) const;
   void DiscardThrough(uint64_t height);
 

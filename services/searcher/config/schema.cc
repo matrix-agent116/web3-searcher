@@ -160,6 +160,15 @@ std::vector<TableSchema> ReadSchema(const std::filesystem::path& path,
   return schemas;
 }
 
+const Field& TableSchema::StoredField(std::string_view field_name) const {
+  auto field = std::ranges::find(fields, field_name, &Field::name);
+  if (field == fields.end() || !field->stored) {
+    throw std::invalid_argument("unknown stored field: " +
+                                std::string(field_name));
+  }
+  return *field;
+}
+
 std::vector<irs::field_id> TableSchema::MatchFields(
     simdjson::dom::array names) const {
   if (names.size() == 0)

@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include "searcher/query/aggregate/executor.h"
+#include "searcher/query/row_scan.h"
 #include "searcher/table/utils.h"
 
 namespace web3::searcher {
@@ -98,7 +100,8 @@ std::size_t Table::SubmitCandidate(uint64_t height, simdjson::dom::array fields,
   solidity_->WithCurrentSnapshot([&](const auto& base) {
     if (height <= base->BlockNumber()) return;
     auto next = views_.Prepare([&] {
-      auto overlay = candidate_.Replace(*base, height, fields, documents);
+      auto overlay =
+          candidate_.Replace(*base, views_.Read(), height, fields, documents);
       return overlay ? overlay : base;
     });
     views_.Publish(std::move(next));
@@ -109,6 +112,17 @@ std::size_t Table::SubmitCandidate(uint64_t height, simdjson::dom::array fields,
 
 absl::int128 Table::GetBlockNumber() const {
   return views_.Read()->BlockNumber();
+}
+
+std::string Table::Aggregate(const AggregatePlan& plan,
+                             std::string_view expression) const {
+  return ExecuteAggregate(plan, views_.Read(), Schema(), expression);
+}
+
+std::string Table::SearchProjected(const RowProjection& projection,
+                                   std::string_view expression,
+                                   SearchLimit limit) const {
+  return projection.Search(*views_.Read(), Schema(), expression, limit);
 }
 
 std::string Table::Search(std::string_view expression,

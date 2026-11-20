@@ -5,6 +5,14 @@ endif()
 
 add_library(web3_searcher_table STATIC
   manager/manager.cc
+  query/aggregate/count.cc
+  query/aggregate/executor.cc
+  query/aggregate/expressions.cc
+  query/aggregate/functions.cc
+  query/aggregate/plan.cc
+  query/aggregate/session.cc
+  query/aggregate/snapshot_rows.cc
+  query/row_scan.cc
   config/schema.cc
   table/view_rebuilder.cc
   table/table.cc
@@ -20,6 +28,16 @@ add_library(web3_searcher_table STATIC
   table/utils.cc
 )
 target_link_libraries(web3_searcher_table PUBLIC web3_http iresearch)
+set(core_functions_dir "${CMAKE_SOURCE_DIR}/third_party/duckdb/extension/core_functions")
+target_include_directories(web3_searcher_table SYSTEM PRIVATE "${core_functions_dir}/include")
+if(IRESEARCH_BENCH)
+  # The minimal DuckDB build omits core_functions. Reuse its two aggregates.
+  target_sources(web3_searcher_table PRIVATE
+    "${core_functions_dir}/aggregate/distributive/sum.cpp"
+    "${core_functions_dir}/aggregate/algebraic/avg.cpp")
+else()
+  target_link_libraries(web3_searcher_table PRIVATE core_functions_extension)
+endif()
 if(WEB3_BUILD_TESTING)
   add_executable(table_tests
     table/view_rebuilder_test.cc
@@ -45,6 +63,8 @@ target_link_libraries(searcher PRIVATE web3_searcher_router)
 if(WEB3_BUILD_TESTING)
   add_executable(searcher_test
     manager/manager_test.cc
+    query/aggregate/plan_test.cc
+    query/aggregate/session_test.cc
     query/query_template_test.cc
     router/internal_routes_test.cc
     router/routes_test.cc
