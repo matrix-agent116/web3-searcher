@@ -1,0 +1,12 @@
+{
+  "path": "/v1/transactions/by-hash",
+  "table": "transactions",
+  "query": {
+    "lucene": "hash:${id}",
+    "limit": 1,
+    "select": {
+      "transaction_id": "hash",
+      "value": "value"
+    }
+  }
+}

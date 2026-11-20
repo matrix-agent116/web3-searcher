@@ -34,9 +34,9 @@ ExternalProject_Add(libhv_source
   SOURCE_DIR "${hv_source}"
   CONFIGURE_COMMAND "" BUILD_COMMAND "" INSTALL_COMMAND "")
 include(CTest)
-set(web3_targets indexer searcher updater indexer_benchmark)
+set(web3_targets searcher updater indexer_benchmark)
 if(BUILD_TESTING)
-  list(APPEND web3_targets http_test table_tests)
+  list(APPEND web3_targets http_test table_tests searcher_test)
 endif()
 
 ExternalProject_Add(serenedb
@@ -66,6 +66,14 @@ add_custom_target(indexer_benchmark DEPENDS serenedb)
 
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  function(add_searcher_test name suite)
+    add_test(NAME ${name} COMMAND "${CMAKE_BINARY_DIR}/bin/searcher_test"
+             "--gtest_filter=${suite}.*" --gtest_fail_if_no_test_selected)
+    set_tests_properties(${name} PROPERTIES TIMEOUT 30)
+  endfunction()
+  add_searcher_test(searcher_test QueryTemplateTest)
+  add_searcher_test(manager_test ManagerTest)
+  add_searcher_test(router_test RouterTest)
   add_test(NAME http_test COMMAND "${CMAKE_BINARY_DIR}/bin/http_test")
   function(add_table_test component filter)
     add_test(NAME ${component}_test COMMAND "${CMAKE_BINARY_DIR}/bin/table_tests"
@@ -75,6 +83,7 @@ if(BUILD_TESTING)
   add_table_test(table "TableTest.*")
   add_table_test(view_rebuilder "ViewRebuilderTest.*")
   add_table_test(candidate "CandidateTest.*")
+  add_table_test(lucene_query "LuceneQueryTest.*")
   add_table_test(memory_segment "MemorySegmentTest.*")
   add_table_test(memory_segment_manager "MemorySegmentManagerTest.*")
   add_table_test(row_codec "RowCodecTest.*")
@@ -84,11 +93,26 @@ if(BUILD_TESTING)
   add_table_test(update_log "UpdateLogTest.*")
   add_table_test(utils "TableUtilsTest.*")
   set_tests_properties(http_test PROPERTIES TIMEOUT 30)
-  add_test(NAME services_smoke COMMAND "${Python3_EXECUTABLE}"
+  add_test(NAME searcher_e2e COMMAND "${Python3_EXECUTABLE}" -B
+           "${CMAKE_CURRENT_SOURCE_DIR}/e2e/searcher_routes.py" "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME searcher_storage_e2e COMMAND "${Python3_EXECUTABLE}" -B
+           "${CMAKE_CURRENT_SOURCE_DIR}/e2e/searcher_storage_e2e.py"
+           "${CMAKE_BINARY_DIR}/bin/searcher")
+  add_test(NAME searcher_e2e_fuzz COMMAND "${Python3_EXECUTABLE}" -B
+           "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/searcher_fuzz.py"
+           "${CMAKE_BINARY_DIR}/bin/searcher")
+  set_tests_properties(searcher_e2e searcher_storage_e2e searcher_e2e_fuzz PROPERTIES LABELS e2e TIMEOUT 60
+    ENVIRONMENT_MODIFICATION "PYTHONPATH=path_list_prepend:${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  set_property(TEST searcher_e2e_fuzz APPEND PROPERTY LABELS fuzz)
+  add_test(NAME services_smoke COMMAND "${Python3_EXECUTABLE}" -B
            "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.py" "${CMAKE_BINARY_DIR}/bin")
   set_tests_properties(services_smoke PROPERTIES TIMEOUT 90)
   add_test(NAME indexer_benchmark_parallel COMMAND "${Python3_EXECUTABLE}"
            "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_parallel.py"
            "${CMAKE_BINARY_DIR}/bin/indexer_benchmark")
   set_tests_properties(indexer_benchmark_parallel PROPERTIES TIMEOUT 20)
+  add_test(NAME indexer_benchmark_retry COMMAND "${Python3_EXECUTABLE}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_retry.py"
+           "${CMAKE_BINARY_DIR}/bin/indexer_benchmark")
+  set_tests_properties(indexer_benchmark_retry PROPERTIES TIMEOUT 30)
 endif()

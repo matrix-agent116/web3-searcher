@@ -40,8 +40,10 @@ int Port(std::string_view origin) {
   throw std::invalid_argument("expected http://127.0.0.1:PORT");
 }
 
-Reply Error(int status, std::string_view message) {
-  return {status, R"({"ok":false,"error":)" + Quote(message) + "}"};
+Reply Error(int status, std::string_view message,
+            bool transport_failure = false) {
+  return {status, R"({"ok":false,"error":)" + Quote(message) + "}",
+          transport_failure};
 }
 
 int Send(HttpResponse* response, Reply reply) {
@@ -128,10 +130,12 @@ void PostAsync(const std::string& origin, const std::string& path,
   int error =
       client.send(request, [done, origin](const HttpResponsePtr& response) {
         if (!response) {
-          done(Error(502, "request to " + origin + " failed"));
+          done(Error(502, "no HTTP response from " + origin, true));
         } else if (response->ContentType() != APPLICATION_JSON ||
                    response->body.size() > kMaxHttpBodyBytes) {
-          done(Error(502, "invalid HTTP response from " + origin));
+          const int status = response->status_code;
+          done(Error(status == 408 || status == 504 ? status : 502,
+                     "invalid HTTP response from " + origin));
         } else {
           done({response->status_code, std::move(response->body)});
         }
@@ -157,9 +161,9 @@ namespace {
 
 using Schedule = std::function<void(std::function<void()>)>;
 
-void ServeWithScheduler(const std::string& origin,
-                        const std::map<std::string, Handler>& routes,
-                        const Schedule& schedule, std::stop_token stop) {
+void ServeWithScheduler(const std::string& origin, const Handlers& posts,
+                        const Handlers& gets, const Schedule& schedule,
+                        std::stop_token stop) {
   const int port = Port(origin);
   SetUpLogging();
   std::signal(SIGPIPE, SIG_IGN);
@@ -171,42 +175,60 @@ void ServeWithScheduler(const std::string& origin,
   service.GET("/health", [](HttpRequest*, HttpResponse* response) {
     return Send(response, {200, R"({"ok":true})"});
   });
-  for (const auto& [path, handler] : routes) {
-    service.POST(path.c_str(), [&, handler](const HttpContextPtr& ctx,
-                                            http_parser_state state,
-                                            const char* data, size_t size) {
-      auto& body = ctx->request->body;
-      if (state == HP_BODY && ctx->response->status_code == HTTP_STATUS_OK) {
-        if (size > kMaxHttpBodyBytes - body.size()) {
-          ctx->response->status_code = HTTP_STATUS_PAYLOAD_TOO_LARGE;
-          return Send(ctx->response.get(),
-                      Error(413, "request exceeds 16 MiB"));
-        }
-        body.append(data, size);
-      }
-      if (state == HP_MESSAGE_COMPLETE) {
-        if (ctx->request->ContentType() != APPLICATION_JSON) {
-          return Send(ctx->response.get(),
-                      Error(415, "expected application/json"));
-        }
-        if (pending.fetch_add(1) >= kMaxHttpInFlight || stopping.load() ||
-            stop.stop_requested()) {
-          --pending;
-          return Send(ctx->response.get(),
-                      Error(503, "service busy or stopping"));
-        }
-        auto done = MakeCompletion(ctx, pending);
-        try {
-          schedule([handler, body = std::move(body), done] {
-            Dispatch(handler, body, done);
+  auto add_routes = [&](const Handlers& routes, bool get) {
+    for (const auto& [path, handler] : routes) {
+      service.Handle(
+          get ? "GET" : "POST", path.c_str(),
+          [&, handler, get](const HttpContextPtr& ctx, http_parser_state state,
+                            const char* data, size_t size) {
+            auto& body = ctx->request->body;
+            if (state == HP_BODY &&
+                ctx->response->status_code == HTTP_STATUS_OK) {
+              if (size > kMaxHttpBodyBytes - body.size()) {
+                ctx->response->status_code = HTTP_STATUS_PAYLOAD_TOO_LARGE;
+                return Send(ctx->response.get(),
+                            Error(413, "request exceeds 16 MiB"));
+              }
+              if (!get) body.append(data, size);
+            }
+            if (state == HP_MESSAGE_COMPLETE) {
+              if (!get && ctx->request->ContentType() != APPLICATION_JSON) {
+                return Send(ctx->response.get(),
+                            Error(415, "expected application/json"));
+              }
+              if (pending.fetch_add(1) >= kMaxHttpInFlight || stopping.load() ||
+                  stop.stop_requested()) {
+                --pending;
+                return Send(ctx->response.get(),
+                            Error(503, "service busy or stopping"));
+              }
+              auto done = MakeCompletion(ctx, pending);
+              try {
+                if (get) {
+                  schedule(
+                      [handler, params = ctx->request->query_params, done] {
+                        std::string object = "{";
+                        for (const auto& [key, value] : params) {
+                          if (object.size() > 1) object += ',';
+                          object += Quote(key) + ":" + Quote(value);
+                        }
+                        Dispatch(handler, object + "}", done);
+                      });
+                } else {
+                  schedule([handler, body = std::move(body), done] {
+                    Dispatch(handler, body, done);
+                  });
+                }
+              } catch (const std::exception& error) {
+                done(Error(503, error.what()));
+              }
+            }
+            return 0;
           });
-        } catch (const std::exception& error) {
-          done(Error(503, error.what()));
-        }
-      }
-      return 0;
-    });
-  }
+    }
+  };
+  add_routes(posts, false);
+  add_routes(gets, true);
   service.preprocessor = [&service](HttpRequest* request,
                                     HttpResponse* response) {
     http_handler* route = nullptr;
@@ -231,11 +253,19 @@ void ServeWithScheduler(const std::string& origin,
 
 }  // namespace
 
+void ServeRoutes(const std::string& origin, const HttpRoutes& routes,
+                 ThreadPool& pool, std::stop_token stop) {
+  ServeWithScheduler(
+      origin, routes.post, routes.get,
+      [&pool](std::function<void()> task) { pool.Commit(std::move(task)); },
+      stop);
+}
+
 void Serve(const std::string& origin,
            const std::map<std::string, Handler>& routes, ThreadPool& pool,
            std::stop_token stop) {
   ServeWithScheduler(
-      origin, routes,
+      origin, routes, {},
       [&pool](std::function<void()> task) { pool.Commit(std::move(task)); },
       stop);
 }
@@ -246,7 +276,7 @@ void Serve(const std::string& origin,
   hv::EventLoopThread worker;
   worker.start();
   ServeWithScheduler(
-      origin, routes,
+      origin, routes, {},
       [&worker](std::function<void()> task) {
         worker.loop()->queueInLoop(std::move(task));
       },

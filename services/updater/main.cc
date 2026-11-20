@@ -14,12 +14,11 @@ int main(int argc, char** argv) {
                           std::move(done));
         };
       };
-      web3::Serve(argv[2], {{"/upsert", forward("/upsert")},
-                            {"/update", forward("/update")},
+      web3::Serve(argv[2], {{"/solidity", forward("/solidity")},
                             {"/candidate", forward("/candidate")}});
       return 0;
     }
-    if (argc == 7 && (std::string_view(argv[1]) == "update" ||
+    if (argc == 7 && (std::string_view(argv[1]) == "solidity" ||
                       std::string_view(argv[1]) == "candidate")) {
       simdjson::dom::parser parser;
       const auto block_number =
@@ -29,13 +28,13 @@ int main(int argc, char** argv) {
       auto documents = parser.load(argv[5]).get_array().value();
       return web3::PrintResponse(web3::Post(
           argv[6],
-          std::string_view(argv[1]) == "candidate" ? "/candidate" : "/update",
+          std::string_view(argv[1]) == "candidate" ? "/candidate" : "/solidity",
           R"({"table":)" + web3::Quote(argv[2]) + R"(,"block_number":)" +
               std::to_string(block_number) + R"(,"match_field":)" + fields +
               R"(,"documents":)" + simdjson::minify(documents) + "}"));
     }
-    std::cerr << "usage: updater serve URL INDEXER_URL\n"
-                 "       updater {update|candidate} TABLE BLOCK_NUMBER "
+    std::cerr << "usage: updater serve URL SEARCHER_URL\n"
+                 "       updater {solidity|candidate} TABLE BLOCK_NUMBER "
                  "MATCH_FIELDS_JSON "
                  "DOCUMENTS.json URL\n";
     return 2;

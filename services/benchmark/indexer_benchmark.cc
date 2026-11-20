@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <future>
 #include <iomanip>
 #include <iostream>
@@ -30,11 +31,13 @@ namespace web3::benchmark {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+constexpr uint64_t kConfirmationDepth = 16;
 constexpr std::string_view kUsage =
-    "usage: indexer_benchmark INDEXER_URL [--blocks N] [--tx-per-block N] "
+    "usage: indexer_benchmark SEARCHER_URL [--blocks N] [--tx-per-block N] "
     "[--queries N] [--query-threads N]\n"
     "defaults: 1000000 blocks, 512 transactions/block, 1 query thread "
-    "searching until writes finish; --queries 0 disables search\n";
+    "searching until writes finish; confirmation lags candidates by 16 blocks; "
+    "--queries 0 disables search\n";
 
 struct Options {
   std::string origin;
@@ -113,9 +116,24 @@ std::string BlockBody(uint64_t height, uint32_t count) {
   return body;
 }
 
-Json Request(const Options& options, const char* path, std::string body,
-             simdjson::dom::parser& parser) {
-  auto reply = Post(options.origin, path, std::move(body));
+constexpr unsigned kMaxRetries = 3;
+
+bool Retryable(const Reply& reply) {
+  return reply.transport_failure || reply.status == 408 || reply.status == 504;
+}
+
+void WaitToRetry(const char* path, unsigned retry, const Reply& reply) {
+  auto delay = std::chrono::milliseconds(100u << retry);
+  std::cerr << absl::StrCat(
+      path, " ",
+      reply.transport_failure ? "transport failure"
+                              : absl::StrCat("HTTP ", reply.status),
+      ", retry ", retry + 1, "/", kMaxRetries, " in ", delay.count(), " ms\n");
+  std::this_thread::sleep_for(delay);
+}
+
+Json ParseReply(const char* path, const Reply& reply,
+                simdjson::dom::parser& parser) {
   if (reply.status != 200)
     throw std::runtime_error(
         absl::StrCat(path, " HTTP ", reply.status, " ", reply.body));
@@ -125,16 +143,106 @@ Json Request(const Options& options, const char* path, std::string body,
   return result;
 }
 
+Json PostWithRetry(const Options& options, const char* path,
+                   const std::string& body, simdjson::dom::parser& parser) {
+  for (unsigned retry = 0;; ++retry) {
+    auto reply = Post(options.origin, path, body);
+    if (!Retryable(reply) || retry == kMaxRetries)
+      return ParseReply(path, reply, parser);
+    WaitToRetry(path, retry, reply);
+  }
+}
+
+std::optional<uint64_t> LastBlock(const Options& options,
+                                  simdjson::dom::parser& parser) {
+  auto height =
+      PostWithRetry(options, "/block_number", R"({"table":"transactions"})",
+                    parser)["block_number"]
+          .value();
+  if (height.is_int64() && height.get_int64().value() == -1)
+    return std::nullopt;
+  return height.get_uint64().value();
+}
+
 uint64_t FirstBlock(const Options& options) {
   simdjson::dom::parser parser;
-  auto height = Request(options, "/block_number", R"({"table":"transactions"})",
-                        parser)["block_number"]
-                    .value();
-  if (height.is_int64() && height.get_int64().value() == -1) return 0;
-  uint64_t last = height.get_uint64().value();
-  if (options.blocks > std::numeric_limits<uint64_t>::max() - last)
+  auto last = LastBlock(options, parser);
+  if (!last) return 0;
+  if (kConfirmationDepth + options.blocks >
+      std::numeric_limits<uint64_t>::max() - *last)
     throw std::overflow_error("insufficient remaining block heights");
-  return last + 1;
+  // The first confirmation must advance the durable height by one.
+  return *last + 1 + kConfirmationDepth;
+}
+
+std::string SearchBody(std::string_view hash) {
+  return absl::StrCat(R"({"table":"transactions","query":"hash:)", hash,
+                      R"("})");
+}
+
+// A lost response may follow a successful commit. Another writer could also
+// have used that height, so verify all submitted rows before counting it.
+bool BlockWasCommitted(const Options& options, uint64_t height,
+                       const std::string& body, simdjson::dom::parser& parser) {
+  auto last = LastBlock(options, parser);
+  if (!last || *last < height) return false;
+  if (*last > height)
+    throw std::runtime_error(
+        absl::StrCat("table advanced past unacknowledged block ", height));
+  simdjson::dom::parser submitted;
+  auto docs = submitted.parse(body)["documents"].get_array().value();
+  for (auto doc : docs) {
+    auto hash = doc["hash"].get_string().value();
+    auto hits =
+        PostWithRetry(options, "/search", SearchBody(hash), parser)["hits"]
+            .get_array()
+            .value();
+    if (hits.size() != 1)
+      throw std::runtime_error(absl::StrCat("cannot verify committed block ",
+                                            height, ", hash ", hash));
+    auto row = hits.at(0).get_object().value();
+    for (auto field : doc.get_object().value()) {
+      auto actual = row[field.key];
+      if (actual.error() ||
+          simdjson::minify(actual.value()) != simdjson::minify(field.value))
+        throw std::runtime_error(
+            absl::StrCat("different data at block ", height, ", hash ", hash));
+    }
+  }
+  return true;
+}
+
+void CheckBlockReply(Json result, std::string_view path, uint64_t height,
+                     uint32_t tx_per_block) {
+  if (result["block_number"].get_uint64().value() != height ||
+      result["upserted"].get_uint64().value() != tx_per_block)
+    throw std::runtime_error(
+        absl::StrCat(path, " incomplete for block ", height));
+}
+
+void ConfirmBlock(const Options& options, uint64_t height,
+                  const std::string& body, simdjson::dom::parser& parser) {
+  for (unsigned retry = 0;; ++retry) {
+    auto reply = Post(options.origin, "/solidity", body);
+    if (Retryable(reply)) {
+      if (BlockWasCommitted(options, height, body, parser)) return;
+      if (retry < kMaxRetries) {
+        WaitToRetry("/solidity", retry, reply);
+        continue;
+      }
+    } else if (retry && reply.status == 400) {
+      // The original request can finish after the height check but before
+      // the retry takes the table's writer lock.
+      std::string_view error;
+      if (!parser.parse(reply.body)["error"].get(error) &&
+          error == "block already finalized" &&
+          BlockWasCommitted(options, height, body, parser))
+        return;
+    }
+    auto result = ParseReply("/solidity", reply, parser);
+    CheckBlockReply(result, "/solidity", height, options.tx_per_block);
+    return;
+  }
 }
 
 struct Measurements {
@@ -142,19 +250,26 @@ struct Measurements {
   // upper bound is less than 1.6% above the sample, even on long runs.
   std::map<uint64_t, uint64_t> latency_buckets;
   uint64_t requests = 0;
+  uint64_t max_ns = 0;
+  uint64_t over_one_second = 0;
   double seconds = 0;
 
   void Record(Clock::duration elapsed) {
+    seconds += std::chrono::duration<double>(elapsed).count();
     uint64_t ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
     int shift = std::max(0, static_cast<int>(std::bit_width(ns)) - 7);
     ++latency_buckets[ns | ((uint64_t{1} << shift) - 1)];
+    max_ns = std::max(max_ns, ns);
+    over_one_second += elapsed > std::chrono::seconds(1);
     ++requests;
   }
 
   void Merge(const Measurements& other) {
     for (auto [ns, count] : other.latency_buckets) latency_buckets[ns] += count;
     requests += other.requests;
+    max_ns = std::max(max_ns, other.max_ns);
+    over_one_second += other.over_one_second;
   }
 
   double PercentileMs(uint64_t p) const {
@@ -174,17 +289,21 @@ struct Measurements {
     std::cout << R"({"requests":)" << requests << R"(,"seconds":)" << seconds
               << R"(,"requests_per_second":)" << requests / seconds
               << R"(,"p50_ms":)" << PercentileMs(50) << R"(,"p95_ms":)"
-              << PercentileMs(95) << R"(,"p99_ms":)" << PercentileMs(99) << '}';
+              << PercentileMs(95) << R"(,"p99_ms":)" << PercentileMs(99)
+              << R"(,"max_ms":)" << max_ns / 1e6 << R"(,"over_1s":)"
+              << over_one_second << '}';
   }
 };
 
 struct Progress {
   std::atomic<uint32_t> started_blocks{0};
+  std::atomic<uint32_t> candidate_blocks{0};
   std::atomic<uint32_t> committed_blocks{0};
+  std::atomic<uint32_t> completed_steps{0};
   std::atomic<uint64_t> queries{0};
   std::atomic<uint64_t> overlapping_searches{0};
   std::atomic<bool> stopped{false};
-  std::latch first_write{1};
+  std::latch first_visible{1};
 };
 
 void ReportProgress(std::stop_token stop, const Progress& progress,
@@ -194,6 +313,7 @@ void ReportProgress(std::stop_token stop, const Progress& progress,
   std::condition_variable_any wake;
   auto previous = Clock::now();
   uint32_t last_blocks = 0;
+  uint32_t last_candidates = 0;
   uint64_t last_queries = 0;
   while (!stop.stop_requested()) {
     wake.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; });
@@ -201,39 +321,67 @@ void ReportProgress(std::stop_token stop, const Progress& progress,
     auto now = Clock::now();
     double seconds = std::chrono::duration<double>(now - previous).count();
     auto blocks = progress.committed_blocks.load();
+    auto candidates = progress.candidate_blocks.load();
     auto queries = progress.queries.load();
     double blocks_per_second = (blocks - last_blocks) / seconds;
     std::ostringstream line;
     line << std::fixed << std::setprecision(1) << "progress blocks=" << blocks
+         << " candidates=" << candidates
          << " transactions=" << uint64_t{blocks} * tx_per_block
          << " queries=" << queries << " blocks/s=" << blocks_per_second
+         << " candidates/s=" << (candidates - last_candidates) / seconds
          << " tx/s=" << blocks_per_second * tx_per_block
          << " queries/s=" << (queries - last_queries) / seconds << '\n';
     std::cerr << line.str();
     previous = now;
     last_blocks = blocks;
+    last_candidates = candidates;
     last_queries = queries;
   }
 }
 
-Measurements Upsert(const Options& options, uint64_t first,
-                    Progress& progress) {
-  Measurements stats;
+struct WriteMeasurements {
+  Measurements candidate;
+  Measurements solidity;
+  double seconds = 0;
+};
+
+WriteMeasurements WriteBlocks(const Options& options, uint64_t first,
+                              Progress& progress) {
+  WriteMeasurements stats;
+  std::deque<std::string> pending;
   simdjson::dom::parser parser;
   auto start = Clock::now();
   for (uint32_t i = 0; i < options.blocks && !progress.stopped; ++i) {
     uint64_t height = first + i;
-    auto body = BlockBody(height, options.tx_per_block);
+    const auto& body =
+        pending.emplace_back(BlockBody(height, options.tx_per_block));
     progress.started_blocks.store(i + 1);
     auto sent = Clock::now();
-    auto result = Request(options, "/upsert", std::move(body), parser);
-    if (result["block_number"].get_uint64().value() != height ||
-        result["upserted"].get_uint64().value() != options.tx_per_block)
-      throw std::runtime_error(
-          absl::StrCat("incomplete upsert for block ", height));
-    progress.committed_blocks.store(i + 1);
-    if (i == 0) progress.first_write.count_down();
-    stats.Record(Clock::now() - sent);
+    // Retrying a candidate replaces the same height with the same documents.
+    auto reply = PostWithRetry(options, "/candidate", body, parser);
+    CheckBlockReply(reply, "/candidate", height, options.tx_per_block);
+    stats.candidate.Record(Clock::now() - sent);
+    progress.candidate_blocks.store(i + 1);
+
+    if (height >= kConfirmationDepth) {
+      const uint64_t target = height - kConfirmationDepth;
+      // On resume, the oldest candidates predate this run. Their synthetic
+      // transactions are reproducible from the height and transaction count.
+      std::string confirmed;
+      if (target < first) {
+        confirmed = BlockBody(target, options.tx_per_block);
+      } else {
+        confirmed = std::move(pending.front());
+        pending.pop_front();
+      }
+      sent = Clock::now();
+      ConfirmBlock(options, target, confirmed, parser);
+      stats.solidity.Record(Clock::now() - sent);
+      ++progress.committed_blocks;
+    }
+    progress.completed_steps.store(i + 1);
+    if (i == 0) progress.first_visible.count_down();
   }
   stats.seconds = std::chrono::duration<double>(Clock::now() - start).count();
   return stats;
@@ -245,18 +393,17 @@ Measurements SearchWorker(const Options& options, uint64_t first,
   Measurements stats;
   simdjson::dom::parser parser;
   for (uint64_t i = worker; !progress.stopped; i += workers) {
-    uint32_t committed = progress.committed_blocks.load();
-    if (options.queries ? i >= *options.queries : committed == options.blocks)
+    uint32_t visible = progress.completed_steps.load();
+    if (options.queries ? i >= *options.queries : visible == options.blocks)
       break;
-    uint64_t row = Mix(i) % (uint64_t{committed} * options.tx_per_block);
+    uint64_t row = Mix(i) % (uint64_t{visible} * options.tx_per_block);
     auto hash =
         Hash(first + row / options.tx_per_block, row % options.tx_per_block);
-    auto body = absl::StrCat(
-        R"({"table":"transactions","field":"hash","value":")", hash, R"("})");
-    auto completed_before = progress.committed_blocks.load();
+    auto body = SearchBody(hash);
+    auto completed_before = progress.completed_steps.load();
     if (!options.queries && completed_before == options.blocks) break;
     auto sent = Clock::now();
-    auto hits = Request(options, "/search", std::move(body), parser)["hits"]
+    auto hits = PostWithRetry(options, "/search", body, parser)["hits"]
                     .get_array()
                     .value();
     if (hits.size() != 1 || hits.at(0)["hash"].get_string().value() != hash)
@@ -276,7 +423,7 @@ Measurements Search(const Options& options, uint64_t first, Progress& progress,
                     ThreadPool& pool, uint32_t workers) {
   Measurements stats;
   if (!workers) return stats;
-  progress.first_write.wait();
+  progress.first_visible.wait();
   if (progress.stopped) return stats;
   std::vector<std::future<Measurements>> tasks;
   tasks.reserve(workers);
@@ -298,7 +445,6 @@ Measurements Search(const Options& options, uint64_t first, Progress& progress,
 
 void Run(const Options& options) {
   uint64_t first = FirstBlock(options);
-  uint64_t total = uint64_t{options.blocks} * options.tx_per_block;
   Progress progress;
   // Reserve an HTTP request for the writer while reads and writes can overlap.
   uint32_t readers =
@@ -311,10 +457,10 @@ void Run(const Options& options) {
   });
   auto writer = pool.Commit([&] {
     try {
-      return Upsert(options, first, progress);
+      return WriteBlocks(options, first, progress);
     } catch (...) {
       progress.stopped = true;
-      if (progress.committed_blocks == 0) progress.first_write.count_down();
+      if (progress.completed_steps == 0) progress.first_visible.count_down();
       throw;
     }
   });
@@ -328,12 +474,20 @@ void Run(const Options& options) {
   auto writes = writer.get();
   reporter.request_stop();
   reporter.join();
+  const auto last = first + (options.blocks - 1);
+  const auto total = writes.solidity.requests * options.tx_per_block;
   std::cout << R"({"ok":true,"first_block":)" << first << R"(,"last_block":)"
-            << first + (options.blocks - 1) << R"(,"transactions":)" << total
+            << last << R"(,"last_solidity_block":)"
+            << (writes.solidity.requests
+                    ? std::to_string(last - kConfirmationDepth)
+                    : "-1")
+            << R"(,"transactions":)" << total
             << R"(,"transactions_per_second":)" << total / writes.seconds
             << R"(,"overlapping_searches":)"
-            << progress.overlapping_searches.load() << R"(,"upsert":)";
-  writes.Print();
+            << progress.overlapping_searches.load() << R"(,"candidate":)";
+  writes.candidate.Print();
+  std::cout << R"(,"solidity":)";
+  writes.solidity.Print();
   std::cout << R"(,"search":)";
   reads.Print();
   std::cout << "}\n";

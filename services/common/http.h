@@ -22,12 +22,20 @@ using Json = simdjson::dom::element;
 struct Reply {
   int status;
   std::string body;
+  // libhv delivered no HTTP response (including connect and request timeouts).
+  bool transport_failure = false;
 };
 
 using Completion = std::function<void(Reply)>;
 // The JSON view lives until the handler returns. A handler may retain the
 // completion and invoke it from any thread when its reply is ready.
 using Handler = std::function<void(Json, Completion)>;
+
+using Handlers = std::map<std::string, Handler>;
+struct HttpRoutes {
+  Handlers get;
+  Handlers post;
+};
 
 std::string Quote(std::string_view value);
 // Validation happens on the caller's thread. Network replies arrive on the
@@ -40,6 +48,8 @@ Reply Post(const std::string& origin, const std::string& path,
 int PrintResponse(const Reply& reply);
 // Business routes run on the supplied pool. The standalone overload uses a
 // dedicated serial worker. Socket I/O and /health run on the HTTP loop.
+void ServeRoutes(const std::string& origin, const HttpRoutes& routes,
+                 ThreadPool& pool, std::stop_token stop = {});
 void Serve(const std::string& origin,
            const std::map<std::string, Handler>& routes, ThreadPool& pool,
            std::stop_token stop = {});
