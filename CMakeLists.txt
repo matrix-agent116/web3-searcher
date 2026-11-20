@@ -34,9 +34,9 @@ ExternalProject_Add(libhv_source
   SOURCE_DIR "${hv_source}"
   CONFIGURE_COMMAND "" BUILD_COMMAND "" INSTALL_COMMAND "")
 include(CTest)
-set(web3_targets indexer searcher updater)
+set(web3_targets indexer searcher updater indexer_benchmark)
 if(BUILD_TESTING)
-  list(APPEND web3_targets http_test storage_test)
+  list(APPEND web3_targets http_test table_tests)
 endif()
 
 ExternalProject_Add(serenedb
@@ -62,24 +62,33 @@ ExternalProject_Add(serenedb
                 --target ${web3_targets}
   BUILD_ALWAYS ON)
 
+add_custom_target(indexer_benchmark DEPENDS serenedb)
+
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_test(NAME http_test COMMAND "${CMAKE_BINARY_DIR}/bin/http_test")
-  function(add_storage_test component filter)
-    add_test(NAME ${component}_test COMMAND "${CMAKE_BINARY_DIR}/bin/storage_test"
+  function(add_table_test component filter)
+    add_test(NAME ${component}_test COMMAND "${CMAKE_BINARY_DIR}/bin/table_tests"
              "--gtest_filter=${filter}" --gtest_fail_if_no_test_selected)
-    set_tests_properties(${component}_test PROPERTIES LABELS storage TIMEOUT 30)
+    set_tests_properties(${component}_test PROPERTIES LABELS table TIMEOUT 30)
   endfunction()
-  add_storage_test(memory_segment "MemorySegmentTest.*")
-  add_storage_test(memory_segment_manager "MemorySegmentManagerTest.*")
-  add_storage_test(row_codec "RowCodecTest.*")
-  add_storage_test(segment_merger "SegmentMergerTest.*:SegmentCleanupTest.*")
-  add_storage_test(snapshot "SnapshotTest.*")
-  add_storage_test(storage "StorageTest.*")
-  add_storage_test(update_log "UpdateLogTest.*")
-  add_storage_test(utils "StorageUtilsTest.*")
+  add_table_test(table "TableTest.*")
+  add_table_test(view_rebuilder "ViewRebuilderTest.*")
+  add_table_test(candidate "CandidateTest.*")
+  add_table_test(memory_segment "MemorySegmentTest.*")
+  add_table_test(memory_segment_manager "MemorySegmentManagerTest.*")
+  add_table_test(row_codec "RowCodecTest.*")
+  add_table_test(segment_merger "SegmentMergerTest.*:SegmentCleanupTest.*")
+  add_table_test(snapshot "SnapshotTest.*")
+  add_table_test(solidity "SolidityTest.*")
+  add_table_test(update_log "UpdateLogTest.*")
+  add_table_test(utils "TableUtilsTest.*")
   set_tests_properties(http_test PROPERTIES TIMEOUT 30)
   add_test(NAME services_smoke COMMAND "${Python3_EXECUTABLE}"
            "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.py" "${CMAKE_BINARY_DIR}/bin")
   set_tests_properties(services_smoke PROPERTIES TIMEOUT 90)
+  add_test(NAME indexer_benchmark_parallel COMMAND "${Python3_EXECUTABLE}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_parallel.py"
+           "${CMAKE_BINARY_DIR}/bin/indexer_benchmark")
+  set_tests_properties(indexer_benchmark_parallel PROPERTIES TIMEOUT 20)
 endif()

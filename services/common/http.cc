@@ -21,7 +21,6 @@
 namespace web3 {
 namespace {
 
-constexpr size_t kMaxBody = 16 * 1024 * 1024;
 constexpr std::string_view kLoopback = "http://127.0.0.1:";
 std::atomic<bool> stopping{false};
 static_assert(std::atomic<bool>::is_always_lock_free);
@@ -84,7 +83,7 @@ Completion MakeCompletion(const HttpContextPtr& ctx,
   return [writer, loop = hv::tlsEventLoop(),
           sent = std::make_shared<std::atomic_flag>(), &pending](Reply reply) {
     if (sent->test_and_set()) return;
-    if (reply.body.size() > kMaxBody)
+    if (reply.body.size() > kMaxHttpBodyBytes)
       reply = Error(500, "response exceeds 16 MiB");
     loop->queueInLoop([writer, reply = std::move(reply), &pending]() mutable {
       if (writer->isConnected()) {
@@ -111,7 +110,7 @@ std::string Quote(std::string_view value) {
 void PostAsync(const std::string& origin, const std::string& path,
                std::string body, Completion done) {
   Port(origin);
-  if (body.size() > kMaxBody) {
+  if (body.size() > kMaxHttpBodyBytes) {
     done(Error(413, "request exceeds 16 MiB"));
     return;
   }
@@ -131,7 +130,7 @@ void PostAsync(const std::string& origin, const std::string& path,
         if (!response) {
           done(Error(502, "request to " + origin + " failed"));
         } else if (response->ContentType() != APPLICATION_JSON ||
-                   response->body.size() > kMaxBody) {
+                   response->body.size() > kMaxHttpBodyBytes) {
           done(Error(502, "invalid HTTP response from " + origin));
         } else {
           done({response->status_code, std::move(response->body)});
@@ -178,7 +177,7 @@ void ServeWithScheduler(const std::string& origin,
                                             const char* data, size_t size) {
       auto& body = ctx->request->body;
       if (state == HP_BODY && ctx->response->status_code == HTTP_STATUS_OK) {
-        if (size > kMaxBody - body.size()) {
+        if (size > kMaxHttpBodyBytes - body.size()) {
           ctx->response->status_code = HTTP_STATUS_PAYLOAD_TOO_LARGE;
           return Send(ctx->response.get(),
                       Error(413, "request exceeds 16 MiB"));
@@ -190,8 +189,7 @@ void ServeWithScheduler(const std::string& origin,
           return Send(ctx->response.get(),
                       Error(415, "expected application/json"));
         }
-        constexpr size_t kMaxInFlight = 64;
-        if (pending.fetch_add(1) >= kMaxInFlight || stopping.load() ||
+        if (pending.fetch_add(1) >= kMaxHttpInFlight || stopping.load() ||
             stop.stop_requested()) {
           --pending;
           return Send(ctx->response.get(),

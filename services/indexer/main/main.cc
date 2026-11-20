@@ -9,7 +9,6 @@
 #include "common/system.h"
 #include "common/thread_pool.h"
 #include "indexer/manager/manager.h"
-#include "indexer/storage/segment_merger.h"
 
 namespace web3::indexer {
 namespace {
@@ -29,18 +28,24 @@ int Run(int argc, char** argv) {
     if (command == "build") {
       return web3::PrintResponse({200, result});
     }
-    SegmentMerger merger(manager.GetStorages());
+    manager.StartMerger();
     web3::ThreadPool pool(web3::CpuCoreCount());
-    auto upsert = [&](web3::Json request, web3::Completion done) {
-      done({200, manager.Upsert(request["table"].get_string().value(),
-                                request["block_number"].get_uint64().value(),
-                                request["match_field"].get_array().value(),
-                                request["documents"].get_array().value())});
+    auto submit = [&](auto method) {
+      return [&, method](web3::Json request, web3::Completion done) {
+        const auto height = request["block_number"].get_uint64().value();
+        const auto count =
+            (manager.*method)(request["table"].get_string().value(), height,
+                              request["match_field"].get_array().value(),
+                              request["documents"].get_array().value());
+        done({200, absl::StrCat(R"({"ok":true,"upserted":)", count,
+                                R"(,"block_number":)", height, "}")});
+      };
     };
     web3::Serve(argv[3],
                 {
-                    {"/upsert", upsert},
-                    {"/update", upsert},
+                    {"/upsert", submit(&Manager::ConfirmBlock)},
+                    {"/update", submit(&Manager::ConfirmBlock)},
+                    {"/candidate", submit(&Manager::SubmitCandidate)},
                     {"/block_number",
                      [&](web3::Json request, web3::Completion done) {
                        const auto number = manager.GetBlockNumber(

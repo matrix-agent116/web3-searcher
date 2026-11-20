@@ -12,15 +12,17 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-运行全部存储组件单元测试可以用 `ctest --test-dir build -L storage --output-on-failure`。单独验证 WAL 可用 `ctest --test-dir build -R '^update_log_test$' --output-on-failure`。
+运行全部存储组件单元测试可以用 `ctest --test-dir build -L table --output-on-failure`。单独验证 WAL 可用 `ctest --test-dir build -R '^update_log_test$' --output-on-failure`。
 
 在 Ubuntu amd64 上，先安装 `build-essential`、`cmake`、`ninja-build`、`python3`、`git` 和 `curl`，再运行相邻 SereneDB 源码中的 `sudo ../serenedb/scripts/setup_dev_toolchain.sh` 安装 Clang 23、LLD 和 compiler-rt。构建和测试使用上面的命令。SereneDB 的默认 amd64 指令集为 Haswell 级别，要求 CPU 支持 AVX2、BMI2 等指令。
 
 首次构建会下载固定版本的 libhv v1.3.4 源码包并校验 SHA-256。libhv 在 SereneDB 的编译环境内生成静态库，服务端和客户端共享该库。
 
-顶层 CMake 使用 `ExternalProject_Add` 调用 SereneDB 的精简构建，通过 `SDB_EXTERNAL_DIRS` 将本项目的三个可执行目标加入同一个编译环境。indexer 链接 `iresearch` 及其传递依赖（含 DuckDB），公共通信代码使用其随附的 simdjson。产物在 `build/bin/`。macOS 的整数类型适配在构建目录内生成，见 `cmake/darwin.cmake`。可通过 `-DWEB3_BUILD_JOBS=4` 指定依赖构建并行度，用 `-DWEB3_CLANG=...` 和 `-DWEB3_CLANGXX=...` 指定编译器。
+顶层 CMake 使用 `ExternalProject_Add` 调用 SereneDB 的精简构建，通过 `SDB_EXTERNAL_DIRS` 将服务和性能测试程序加入同一个编译环境。indexer 链接 `iresearch` 及其传递依赖（含 DuckDB），公共通信代码使用其随附的 simdjson。产物在 `build/bin/`。macOS 的整数类型适配在构建目录内生成，见 `cmake/darwin.cmake`。可通过 `-DWEB3_BUILD_JOBS=4` 指定依赖构建并行度，用 `-DWEB3_CLANG=...` 和 `-DWEB3_CLANGXX=...` 指定编译器。
 
-indexer 的 `config/schema.*` 负责解析表配置。`manager/manager.*` 负责逐表创建、打开和按名称查表。`storage/storage.*` 负责单表读写、恢复和发布。每张表的 `Storage` 持有一个 `MemorySegmentManager`。`storage/memory_segment.*` 负责将单个批次封存为一个内存段，`storage/memory_segment_manager.*` 管理本表的内存段、累计文档数和后台内存合并线程。达到刷盘阈值时，它按写入顺序将内存段直接合并写入磁盘并同步文件。随后由 `Storage` 发布清单和快照、回收旧 WAL。`storage/snapshot.*` 管理可见记录、删除掩码和列补丁。`storage/row_codec.*` 按 schema 将 JSON 文档写入索引，并将存储列读回 JSON。`storage/update_log.*` 负责预写日志（WAL）的追加、重放和清理。`storage/segment_merger.*` 负责调度磁盘段合并并回收旧段文件。`storage/utils.*` 提供目录锁、文件同步、段 ID 解析、磁盘段写入与清单读写。首次建表由 `Storage::Write` 直接写入种子文档。CLI 和 HTTP 路由共用同一个 `Manager`。
+indexer 的 `config/schema.*` 负责解析表配置。`manager/manager.*` 按表名管理并调用 `Table`。
+
+`table/table.*` 封装建表、整块提交、读高度和查询。每张表有一个 `Solidity` 保存固化数据，一个 `Candidate`（`table/candidate.*`）按高度管理候选块的 IResearch 内存段。`table/solidity.*` 负责单表读写、恢复和发布。每张表的 `Solidity` 持有一个 `MemorySegmentManager`。`table/memory_segment.*` 负责将单个批次封存为一个内存段，`table/memory_segment_manager.*` 管理本表的内存段、累计文档数和后台内存合并线程。达到刷盘阈值时，它按写入顺序将内存段直接合并写入磁盘并同步文件。随后由 `Solidity` 发布清单和快照、回收旧 WAL。`table/snapshot.*` 管理可见记录、删除掩码和列补丁。`table/row_codec.*` 按 schema 将 JSON 文档写入索引，并将存储列读回 JSON。`table/update_log.*` 负责预写日志（WAL）的追加、重放和清理。`table/segment_merger.*` 负责调度磁盘段合并并回收旧段文件。`table/utils.*` 提供目录锁、文件同步、段 ID 解析、磁盘段写入与清单读写。首次建表由 `Solidity::Write` 直接写入种子文档。CLI 和 HTTP 路由共用同一个 `Manager`。
 
 ## 按 schema 建表
 
@@ -62,15 +64,19 @@ build/bin/searcher serve "$searcher_url" "$indexer_url" & searcher_pid=$!
 | 服务 | 接口 | 用途 |
 | --- | --- | --- |
 | 三个服务 | `GET /health` | 检查当前进程，成功返回 `{"ok":true}` |
-| updater | `POST /upsert`、`POST /update` | 将指定表的 upsert 批次异步转发给 indexer |
+| updater | `POST /candidate`、`POST /upsert`、`POST /update` | 转发指定表的完整候选块或固化块 |
 | searcher | `POST /search`、`POST /block_number` | 按字段查找记录，或按表读取最新区块高度 |
-| indexer | `POST /upsert`、`POST /update`、`POST /search`、`POST /block_number` | 按匹配字段更新记录、查询数据或读取表的最新区块高度 |
+| indexer | `POST /candidate`、`POST /upsert`、`POST /update`、`POST /search`、`POST /block_number` | 按匹配字段更新记录、查询数据或读取表的最新区块高度 |
 
 POST 请求使用 `Content-Type: application/json`。业务 JSON 请求体上限为 16 MiB，返回值包含 `ok`，错误响应使用 HTTP 错误状态码并包含 `error`。
 
 indexer 和 searcher 使用 `web3::ThreadPool` 处理业务请求。`Commit(fn)` 将函数加入队列，返回可取得结果或异常的 `std::future`。两者启动时分别按逻辑 CPU 数创建工作线程。Linux 优先使用 CPU 亲和性掩码，支持 `taskset` 和容器的 cpuset。indexer 在启动时打开各表的 IResearch reader，并发查询复用已打开的只读索引。updater 在单独的工作线程上接收批次并异步转发更新请求。三个服务的 HTTP 线程均可独立响应 `/health`。每个进程最多接受 64 个尚未完成的业务请求，达到上限时返回 HTTP 503。命令行工具同步等待结果。
 
-每张表独立记录最新成功提交的 `block_number`，新表返回 `-1`，表示尚未提交任何区块。首次成功提交区块 `0` 后返回 `0`。每次 Upsert 都在请求顶层传入整批的区块高度，使用非负 JSON 整数，可在同一高度分批写入，也可跳过高度。低于当前高度的写入返回 HTTP 400。空文档批次可以推进高度。成功响应包含 `upserted` 和 `block_number`。
+每次请求提交一个区块在一张表中的全部文档。两类提交都使用 `table`、`block_number`、`match_field` 和 `documents`。高度使用非负整数，空区块传 `documents: []`。
+
+- `POST /candidate` 提交候选块。同高度的新块整块替换旧块，更高的候选块保留并按高度顺序应用。已固化高度及以下的迟到候选块返回成功，`upserted` 为 0。候选块仅驻留内存，重启后可由上游重送。
+- `POST /upsert` 或 `POST /update` 固化完整区块。新高度必须严格大于当前固化高度，可以跳过高度。重复或回退的高度返回 HTTP 400。写入成功后，查询一次性切换到新的固化数据和所有更高的候选块。固化失败保留原查询视图。较高候选块的匹配键如果在新视图中变得不唯一，该候选块整体暂缓展示，后续替换或固化会重新计算。
+- `POST /search` 只取得一次已发布快照。每张表的后台线程在候选块替换、固化、重载和段合并时构建查询视图。每次构建有独立的版本号，同高度替换也会产生新版本。重建期间仍可读取旧快照，固化数据可恢复且新快照发布后，固化请求才返回成功。`POST /block_number` 返回这张表最新的固化高度，新表返回 `-1`，固化区块 `0` 后返回 `0`。
 
 向 indexer 或 searcher 发送 `POST /block_number`，请求体为 `{"table":"transactions"}`，即可读取该表当前可见的高度。未刷盘批次的高度和文档一起写入 WAL 并发布。刷盘时，高度和磁盘段列表写入同一份清单，重启后从清单开始，按顺序重放完整的 WAL 记录。
 
@@ -84,18 +90,43 @@ curl -sS -H 'Content-Type: application/json' \
   -d '{"table":"transactions","block_number":17,"match_field":["hash"],"documents":[{"hash":"0x01","blockNumber":"0x11"}]}' \
   "$updater_url/upsert"
 # 也可以提交包含 JSON 对象数组的文件
-build/bin/updater update transactions 17 '["hash", "blockNumber"]' examples/transactions.json "$updater_url"
+build/bin/updater candidate transactions 18 '["hash", "blockNumber"]' examples/transactions.json "$updater_url"
 curl -sS -H 'Content-Type: application/json' \
   -d '{"table":"blocks","field":"metadata.tags","value":"offline"}' \
   "$searcher_url/search"
 build/bin/searcher query transactions blockNumber 0x10 "$searcher_url"
 ```
 
-客户端通过 `POST /upsert` 批量提交同一张表的文档（`POST /update` 也接受同样的请求），每次传入 `match_field` 和 `documents` 两个数组。单条写入传只有一个元素的数组。indexer 把小批更新追加到该表的预写日志（WAL），同步到磁盘后发布可查询的 IResearch 内存索引。达到该表的刷盘阈值时，当前请求将累积的记录写成磁盘 segment，再切换 manifest。低频更新保留在 WAL 中，进程重启时会自动恢复。
+客户端通过 `POST /upsert` 提交一个完整固化块在该表的全部文档（`POST /update` 也接受同样的请求），每次传入 `match_field` 和 `documents` 两个数组。单条写入传只有一个元素的数组。indexer 把小批更新追加到该表的预写日志（WAL），同步到磁盘后发布可查询的 IResearch 内存索引。达到该表的刷盘阈值时，当前请求将累积的记录写成磁盘 segment，再切换 manifest。低频更新保留在 WAL 中，进程重启时会自动恢复。
 
-首次离线构建的示例结果为 `{"ok":true,"tables":2,"indexed":3}`。更新以批次为单位发布，响应中的 `upserted` 是处理的输入条数。返回成功后，新查询立即可见，重启会从磁盘恢复。同表写入串行提交。每次查询持有一个已提交的快照，写入期间仍可查询。查询跳过已被完全覆盖的 segment，其余 segment 使用 IResearch 文档掩码过滤旧记录。匹配更新使用 IResearch 布尔查询对全部匹配字段取交集，并过滤已失效的记录。普通查询访问含有效记录的磁盘 segment 和内存中的更新。交易数组通过表的 `documents` 配置导入。普通 VARCHAR 按字段原值匹配。
+首次离线构建的示例结果为 `{"ok":true,"tables":2,"indexed":3}`。更新以整块为单位发布，响应中的 `upserted` 是处理的输入条数。固化块发布后，新查询立即可见，重启会从磁盘恢复。同表写入串行提交。每次查询持有一个已提交的快照，写入期间仍可查询。查询跳过已被完全覆盖的 segment，其余 segment 使用 IResearch 文档掩码过滤旧记录。匹配更新使用 IResearch 布尔查询对全部匹配字段取交集，并过滤已失效的记录。普通查询访问含有效记录的磁盘 segment 和内存中的更新。交易数组通过表的 `documents` 配置导入。普通 VARCHAR 按字段原值匹配。
 
 ```sh
 kill "$searcher_pid" "$updater_pid" "$indexer_pid"
 wait
 ```
+
+## 测试 indexer 性能
+
+`indexer_benchmark` 通过 HTTP 直接访问 indexer。一个专用写线程从 `transactions` 的下一固化高度开始，按顺序向 `/upsert` 提交整块交易。首块确认后，查询线程通过 `/search` 并发检索本轮已确认交易的哈希。每笔交易按示例 schema 生成，每次运行都会向目标表追加数据。
+
+使用独立的测试索引目录启动 indexer：
+
+```sh
+bench_dir=$(mktemp -d)
+cp examples/{schema,transactions,blocks}.json "$bench_dir/"
+build/bin/indexer serve "$bench_dir" http://127.0.0.1:9411
+```
+
+在另一个终端运行：
+
+```sh
+build/bin/indexer_benchmark http://127.0.0.1:9411 \
+  --blocks 256 --query-threads 4
+```
+
+默认写入 100 万块，每块 512 笔，共 5.12 亿笔。默认用 1 个查询线程，最后一块确认后停止发起查询，并等待已发出的查询返回。`--queries N` 指定本轮总查询次数，读写各自完成指定的工作量后退出。`--queries 0` 只测写入。多块压测时最多同时发起 63 个查询，为写线程预留 1 个 HTTP 请求名额。示例交易表每 4096 笔交易触发一次刷盘。
+
+压测期间每秒向 stderr 打印累计完成的区块、交易和查询数，以及本采样区间的 `blocks/s`、`tx/s` 和 `queries/s`。将 stdout 重定向到文件，终端仍能看到实时进度。
+
+程序校验每块的写入条数和返回高度，并检查每次查询恰好命中指定交易。成功后向 stdout 写一条 JSON，失败时以非零状态退出。`transactions_per_second` 是整个写入阶段的交易吞吐量，包含客户端生成数据的时间。`overlapping_searches` 是客户端观察到与至少一个 Upsert 请求在时间上重叠的查询数。`upsert` 和 `search` 分别报告总耗时、每秒请求数和 HTTP 请求的 P50、P95、P99 延迟（毫秒）。分位数按延迟直方图估算，取所在桶的上界，向上误差小于 1.6%。

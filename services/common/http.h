@@ -3,6 +3,7 @@
 
 #include <simdjson.h>
 
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <stop_token>
@@ -10,6 +11,9 @@
 #include <string_view>
 
 namespace web3 {
+
+inline constexpr std::size_t kMaxHttpBodyBytes = 16 * 1024 * 1024;
+inline constexpr unsigned kMaxHttpInFlight = 64;
 
 class ThreadPool;
 

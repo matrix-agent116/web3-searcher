@@ -1,27 +1,33 @@
-add_library(web3_indexer_storage STATIC
+add_library(web3_indexer_table STATIC
   config/schema.cc
-  storage/memory_segment.cc
-  storage/memory_segment_manager.cc
-  storage/row_codec.cc
-  storage/segment_merger.cc
-  storage/snapshot.cc
-  storage/storage.cc
-  storage/update_log.cc
-  storage/utils.cc
+  table/view_rebuilder.cc
+  table/table.cc
+  table/candidate.cc
+  table/memory_segment.cc
+  table/memory_segment_manager.cc
+  table/row_codec.cc
+  table/segment_merger.cc
+  table/snapshot.cc
+  table/solidity.cc
+  table/update_log.cc
+  table/utils.cc
 )
-target_link_libraries(web3_indexer_storage PUBLIC web3_http iresearch)
+target_link_libraries(web3_indexer_table PUBLIC web3_http iresearch)
 add_executable(indexer main/main.cc manager/manager.cc)
-target_link_libraries(indexer PRIVATE web3_indexer_storage)
+target_link_libraries(indexer PRIVATE web3_indexer_table)
 if(WEB3_BUILD_TESTING)
-  add_executable(storage_test
-    storage/memory_segment_test.cc
-    storage/memory_segment_manager_test.cc
-    storage/row_codec_test.cc
-    storage/segment_merger_test.cc
-    storage/snapshot_test.cc
-    storage/storage_test.cc
-    storage/update_log_test.cc
-    storage/utils_test.cc
+  add_executable(table_tests
+    table/view_rebuilder_test.cc
+    table/table_test.cc
+    table/candidate_test.cc
+    table/memory_segment_test.cc
+    table/memory_segment_manager_test.cc
+    table/row_codec_test.cc
+    table/segment_merger_test.cc
+    table/snapshot_test.cc
+    table/solidity_test.cc
+    table/update_log_test.cc
+    table/utils_test.cc
   )
-  target_link_libraries(storage_test PRIVATE web3_indexer_storage GTest::gtest_main)
+  target_link_libraries(table_tests PRIVATE web3_indexer_table GTest::gtest_main)
 endif()
